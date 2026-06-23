@@ -28,6 +28,22 @@ from .calib import load_stereo
 from .treadmill_control import TreadmillController
 
 
+def _selected_pose_config(cfg):
+    pose = dict(cfg.get("pose", default={}) or {})
+    profiles = pose.get("profiles") or {}
+    name = pose.get("profile")
+    if name and isinstance(profiles, dict):
+        profile = profiles.get(name)
+        if profile is None:
+            print(f"[engine] pose.profile={name!r} not found; using pose defaults")
+        else:
+            merged = dict(pose)
+            merged.update(profile or {})
+            merged["profile"] = name
+            pose = merged
+    return pose
+
+
 class Engine:
     def __init__(self, config_path: str, mode: str | None = None):
         self.cfg = load_config(config_path)
@@ -184,7 +200,7 @@ class Engine:
         from .pose.filtering import PoseSmoother
         from .pose.triangulate import triangulate, reprojection_errors
         from .pose.angles import compute_angles
-        p = self.cfg.get("pose", default={})
+        p = _selected_pose_config(self.cfg)
         device = p.get("device", "cpu")
         if device == "cuda":
             try:
@@ -218,7 +234,9 @@ class Engine:
         self.state.set_status(calibrated_3d=self.stereo is not None,
                               pose_device=device,
                               pose_half=bool(p.get("half", True) and device == "cuda"),
-                              pose_imgsz=int(p.get("imgsz", 640) or 640))
+                              pose_imgsz=int(p.get("imgsz", 640) or 640),
+                              pose_model=os.path.basename(str(model)),
+                              pose_profile=p.get("profile", "custom"))
 
         while not self._stop.is_set():
             t_loop = clock.mono()
@@ -228,17 +246,17 @@ class Engine:
                 time.sleep(0.002)
                 continue
             last[0], last[1] = seq0, seq1
-            self.state.frame[0].set(s0.value, s0.t)
-            if s1 is not None:
-                self.state.frame[1].set(s1.value, s1.t)
 
             kp1 = None
             if s1 is not None:
                 kp0, kp1 = self._pose_det.detect_many([s0.value, s1.value])
+                self.state.frame[0].set(s0.value, s0.t)
                 self.state.kp2d[0].set(kp0, s0.t)
+                self.state.frame[1].set(s1.value, s1.t)
                 self.state.kp2d[1].set(kp1, s1.t)
             else:
                 kp0 = self._pose_det.detect(s0.value)
+                self.state.frame[0].set(s0.value, s0.t)
                 self.state.kp2d[0].set(kp0, s0.t)
 
             if self.recorder and self.recorder.armed:

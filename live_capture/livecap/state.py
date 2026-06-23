@@ -54,6 +54,7 @@ class SharedState:
             "pose_valid_joints": 0, "pose_reproj_error_px": 0.0,
             "pose_smoothing": False, "pose_device": "unknown",
             "pose_half": False, "pose_imgsz": 0,
+            "pose_model": "unknown", "pose_profile": "custom",
             "force_auto_bw_ready": False, "force_auto_bw_samples": 0,
             "force_auto_bw_needed": 0, "force_auto_bw_cv": 0.0,
             # treadmill

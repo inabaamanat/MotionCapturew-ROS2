@@ -20,6 +20,7 @@ import numpy as np
 from .config import load_config
 from .calib import load_stereo
 from .sources.camera import make_cameras
+from .engine import _selected_pose_config
 
 
 class Report:
@@ -89,9 +90,12 @@ def _check_stereo_calib(cfg, rep):
 
 
 def _check_model_and_cuda(cfg, rep):
-    p = cfg.get("pose", default={})
+    p = _selected_pose_config(cfg)
     model = p.get("model", "yolo11n-pose.pt")
     model_abs = cfg.abspath(model)
+    if p.get("profile"):
+        rep.ok(f"pose profile selected: {p.get('profile')}")
+    rep.ok(f"pose model configured: {model}, imgsz {p.get('imgsz', 640)}, target {p.get('target_fps', 30)} fps")
     if model_abs and os.path.exists(model_abs):
         rep.ok(f"pose model found: {model_abs}")
     else:

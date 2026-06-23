@@ -56,9 +56,16 @@ def _panel(img, x, y, w, h, title=None):
 
 
 def _fit_image(frame, w, h, bg=(12, 12, 14)):
+    if frame is None:
+        return np.full((h, w, 3), bg, np.uint8)
+    canvas, _, _, _ = _fit_image_with_transform(frame, w, h, bg)
+    return canvas
+
+
+def _fit_image_with_transform(frame, w, h, bg=(12, 12, 14)):
     canvas = np.full((h, w, 3), bg, np.uint8)
     if frame is None:
-        return canvas
+        return canvas, 1.0, 0, 0
     fh, fw = frame.shape[:2]
     scale = min(w / max(1, fw), h / max(1, fh))
     nw, nh = max(1, int(round(fw * scale))), max(1, int(round(fh * scale)))
@@ -66,7 +73,17 @@ def _fit_image(frame, w, h, bg=(12, 12, 14)):
     x0 = (w - nw) // 2
     y0 = (h - nh) // 2
     canvas[y0:y0 + nh, x0:x0 + nw] = resized
-    return canvas
+    return canvas, scale, x0, y0
+
+
+def _map_kp_to_fit(kp, scale, x0, y0):
+    if kp is None:
+        return None
+    out = np.asarray(kp, dtype=float).copy()
+    good = np.isfinite(out[:, 0]) & np.isfinite(out[:, 1])
+    out[good, 0] = out[good, 0] * scale + x0
+    out[good, 1] = out[good, 1] * scale + y0
+    return out
 
 
 def _mid(a, b):
@@ -267,6 +284,72 @@ def draw_skeleton_2d(frame, kp, angles):
                 dx = 8 if tag == "R" else -52
                 _text(frame, f"{v:.0f}", (int(J[0]) + dx, int(J[1])), 0.5,
                       _side_color(tag), 2)
+    return frame
+
+
+def _joint_quality(p):
+    c = p[2] if len(p) > 2 and np.isfinite(p[2]) else 0.0
+    return float(np.clip(c, 0.0, 1.0))
+
+
+def _quality_color(tag, q):
+    base = np.asarray(_side_color(tag), dtype=float)
+    low = np.asarray(WARN, dtype=float)
+    t = np.clip((q - 0.25) / 0.55, 0.0, 1.0)
+    return tuple(int(v) for v in (low * (1.0 - t) + base * t))
+
+
+def _draw_crosshair(img, pt, color, r=6):
+    x, y = int(round(pt[0])), int(round(pt[1]))
+    cv2.circle(img, (x, y), r, (10, 10, 12), -1, cv2.LINE_AA)
+    cv2.circle(img, (x, y), r, color, 2, cv2.LINE_AA)
+    cv2.line(img, (x - r - 3, y), (x + r + 3, y), color, 1, cv2.LINE_AA)
+    cv2.line(img, (x, y - r - 3), (x, y + r + 3), color, 1, cv2.LINE_AA)
+
+
+def draw_precision_pose_overlay(frame, kp, angles):
+    """Draw the measured keypoints/segments, not a stylized anatomy proxy."""
+    if kp is None:
+        return frame
+    for an, bn, tag in SKELETON:
+        a, b = kp[IDX[an]], kp[IDX[bn]]
+        if np.all(np.isfinite(a[:2])) and np.all(np.isfinite(b[:2])):
+            q = min(_joint_quality(a), _joint_quality(b))
+            c = _quality_color(tag, q)
+            cv2.line(frame, _as_pt(a[:2]), _as_pt(b[:2]), (8, 8, 10), 5, cv2.LINE_AA)
+            cv2.line(frame, _as_pt(a[:2]), _as_pt(b[:2]), c, 2, cv2.LINE_AA)
+
+    label_joints = {
+        "Lshoulder", "Rshoulder", "Lhip", "Rhip",
+        "Lknee", "Rknee", "Lankle", "Rankle", "Lelbow", "Relbow",
+    }
+    for name in label_joints:
+        p = kp[IDX[name]]
+        if np.all(np.isfinite(p[:2])):
+            tag = "L" if name.startswith("L") else ("R" if name.startswith("R") else "C")
+            _draw_crosshair(frame, p[:2], _quality_color(tag, _joint_quality(p)),
+                            6 if name.endswith(("hip", "knee", "ankle")) else 4)
+
+    if angles:
+        labels = [
+            ("Lhip", "hip_flexion_l", "hip"),
+            ("Rhip", "hip_flexion_r", "hip"),
+            ("Lknee", "knee_angle_l", "knee"),
+            ("Rknee", "knee_angle_r", "knee"),
+        ]
+        for jn, key, short in labels:
+            p = kp[IDX[jn]]
+            v = _safe(angles.get(key))
+            if np.all(np.isfinite(p[:2])) and np.isfinite(v):
+                side = "L" if jn.startswith("L") else "R"
+                dx = 10 if side == "R" else -88
+                org = (int(p[0]) + dx, int(p[1]) - 10)
+                _text(frame, f"{side} {short} {v:.1f}deg", (org[0] + 1, org[1] + 1),
+                      0.46, (5, 5, 6), 3)
+                _text(frame, f"{side} {short} {v:.1f}deg", org, 0.46,
+                      _side_color(side), 1)
+
+    _text(frame, "precision overlay: measured keypoints", (12, 22), 0.5, FG, 1)
     return frame
 
 
@@ -597,7 +680,7 @@ def _draw_anatomical_skeleton(img, pts, scale):
     return True
 
 
-def draw_anatomical_overlay_2d(frame, kp):
+def draw_anatomical_overlay_2d(frame, kp, glow=False):
     pts = _anatomy_points_from_kp2d(kp)
     if pts is None:
         return False
@@ -610,6 +693,9 @@ def draw_anatomical_overlay_2d(frame, kp):
     lo = np.nanmin(body_pts, axis=0)
     hi = np.nanmax(body_pts, axis=0)
     scale = max(80.0, float(max(hi - lo)))
+
+    if not glow:
+        return _draw_anatomical_skeleton(frame, pts, scale)
 
     skel = np.zeros_like(frame)
     if not _draw_anatomical_skeleton(skel, pts, scale):
@@ -671,7 +757,9 @@ def status_bar(img, x, y, w, h, st):
         f"t={st.get('session_t',0):.1f}s",
         f"cam0 {st.get('cam0_fps',0):.0f}fps", f"cam1 {st.get('cam1_fps',0):.0f}fps",
         f"pose {st.get('pose_fps',0):.0f}fps", f"force {st.get('force_fps',0):.0f}Hz",
+        f"{st.get('pose_profile','custom')}",
         f"{st.get('pose_device','?')}{'/fp16' if st.get('pose_half') else ''}",
+        f"img {st.get('pose_imgsz',0)}",
         f"lat {st.get('cam0_latency_ms',0):.0f}/{st.get('cam1_latency_ms',0):.0f}ms",
         f"3D {'ON' if st.get('calibrated_3d') else 'off'}",
         f"joints {st.get('pose_valid_joints',0):.0f}/17",
@@ -790,24 +878,33 @@ def _pose_state(state):
     return pts3d, valid, kp2d_s, gait_s, ang_s
 
 
-def _camera_panel(img, x, y, w, h, state, ci, angles=None, title=None):
+def _camera_panel(img, x, y, w, h, state, ci, angles=None, title=None,
+                  overlay_style="anatomical"):
     _panel(img, x, y, w, h, title or f"cam{ci}")
     px, py, pw, ph = x + 8, y + 26, w - 16, h - 34
     slot, _ = state.frame[ci].get()
     kp_s, _ = state.kp2d[ci].get()
-    frame = None
     if slot is not None:
-        frame = slot.value.copy()
-        if not draw_anatomical_overlay_2d(frame, kp_s.value if kp_s else None):
-            draw_skeleton_2d(frame, kp_s.value if kp_s else None,
-                             angles.value if angles else None)
-    fitted = _fit_image(frame, pw, ph)
+        fitted, scale, ox, oy = _fit_image_with_transform(slot.value, pw, ph)
+        kp_is_fresh = kp_s is not None and abs(float(slot.t) - float(kp_s.t)) <= 0.08
+        kp = _map_kp_to_fit(kp_s.value, scale, ox, oy) if kp_is_fresh else None
+        angle_values = angles.value if angles else None
+        if overlay_style == "anatomical":
+            if not draw_anatomical_overlay_2d(fitted, kp, glow=False):
+                draw_skeleton_2d(fitted, kp, angle_values)
+        elif overlay_style == "precision":
+            draw_precision_pose_overlay(fitted, kp, angle_values)
+        elif overlay_style == "simple":
+            draw_skeleton_2d(fitted, kp, angle_values)
+    else:
+        fitted = _fit_image(None, pw, ph)
     img[py:py + ph, px:px + pw] = fitted
-    if frame is None:
+    if slot is None:
         _text(img, "no signal", (px + 18, py + ph // 2), 0.55, MUTED, 1)
 
 
 def _overlay_camera_id(state, preferred=1):
+    preferred = 1 if int(preferred or 0) == 1 else 0
     s, _ = state.frame[preferred].get()
     if s is not None and s.value is not None:
         return preferred
@@ -818,7 +915,8 @@ def _overlay_camera_id(state, preferred=1):
     return preferred
 
 
-def _build_focus_dashboard(state, size, focus, window_s, body_mass_kg):
+def _build_focus_dashboard(state, size, focus, window_s, body_mass_kg,
+                           overlay_camera=1):
     W, H = size
     cv = np.full((H, W, 3), BG, np.uint8)
     focus = focus if focus in FOCUS_KEYS else "skeleton"
@@ -831,11 +929,12 @@ def _build_focus_dashboard(state, size, focus, window_s, body_mass_kg):
 
     if focus in ("cam0", "cam1"):
         _camera_panel(cv, fx, fy, fw, fh, state, int(focus[-1]), ang_s,
-                      f"{focus} focused")
+                      f"{focus} precision view", overlay_style="precision")
     elif focus == "skeleton":
-        ci = _overlay_camera_id(state)
+        ci = _overlay_camera_id(state, overlay_camera)
         _camera_panel(cv, fx, fy, fw, fh, state, ci, ang_s,
-                      f"skeleton overlay cam{ci}")
+                      f"precision skeleton overlay cam{ci}",
+                      overlay_style="precision")
     elif focus == "grf":
         ft, fxv = state.force_hist.snapshot()
         lfz = fxv[:, 2] / bw * 100 if fxv.size else None
@@ -877,9 +976,10 @@ def _build_focus_dashboard(state, size, focus, window_s, body_mass_kg):
 
 # ---------- top-level composite ----------
 def build_dashboard(state, size=(1600, 900), window_s=6.0, body_mass_kg=82.0,
-                    focus=None, layout_controls=None):
+                    focus=None, layout_controls=None, overlay_camera=1):
     if focus:
-        return _build_focus_dashboard(state, size, focus, window_s, body_mass_kg)
+        return _build_focus_dashboard(state, size, focus, window_s, body_mass_kg,
+                                      overlay_camera=overlay_camera)
     W, H = size
     cv = np.full((H, W, 3), BG, np.uint8)
     bw = body_mass_kg * 9.80665
@@ -888,14 +988,18 @@ def build_dashboard(state, size=(1600, 900), window_s=6.0, body_mass_kg=82.0,
 
     # compact camera previews, fitted to 16:9 without stretching
     ang_s, _ = state.angles.get()
+    selected_overlay = 1 if int(overlay_camera or 0) == 1 else 0
     for ci in (0, 1):
-        _camera_panel(cv, *layout[f"cam{ci}"], state, ci, ang_s)
+        title = f"cam{ci} -> overlay" if ci == selected_overlay else f"cam{ci}"
+        _camera_panel(cv, *layout[f"cam{ci}"], state, ci, ang_s, title,
+                      overlay_style="simple")
 
     # primary live camera view with anatomical skeleton overlay
     pts3d, valid, kp2d_s, gait_s, ang_s = _pose_state(state)
-    ci = _overlay_camera_id(state)
+    ci = _overlay_camera_id(state, overlay_camera)
     _camera_panel(cv, *layout["skeleton"], state, ci, ang_s,
-                  f"skeleton overlay cam{ci}")
+                  f"precision skeleton overlay cam{ci}",
+                  overlay_style="precision")
 
     # left column support panels
     st = state.get_status()

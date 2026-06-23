@@ -15,7 +15,7 @@ mode: live          # replay | live
 cameras:
   # LIVE: USB cameras via OpenCV device indices.
   live:
-    cam0: "2"
+    cam0: "0"
     cam1: "4"
     # OpenCV latency tuning (applied by CameraSource):
     width: 1280
@@ -85,21 +85,48 @@ calibration:
 # Pose / 3D
 # --------------------------------------------------------------------
 pose:
-  model: yolo11n-pose.pt
+  # Profile options:
+  #   precision_4080  -> best joint localization using the RTX 4080, more GPU load
+  #   balanced_4080   -> strong accuracy with lower latency
+  #   low_latency     -> original tiny model for fastest feedback
+  profile: balanced_4080
+  model: yolo11m-pose.pt
   device: cuda          # cuda on the capture PC; cpu fallback elsewhere
-  conf_thresh: 0.3
-  target_fps: 30        # pose processing rate cap
-  imgsz: 640             # YOLO inference size; 640 is a strong latency/accuracy tradeoff
+  conf_thresh: 0.25
+  target_fps: 30        # USB cameras are currently configured at 30 fps
+  imgsz: 832             # higher input size improves joint localization
   half: true             # FP16 on CUDA for lower latency
   max_det: 1             # only track the primary subject
   fuse: true             # fuse model layers at startup where supported
   warmup: true           # run one startup inference to avoid first-frame stall
-  warmup_shape: [1280, 720]  # [height, width] matching the portrait camera frames
+  warmup_shape: [720, 1280]  # [height, width] matching the USB camera frames
   warmup_batch: 2        # stereo pair batch warmup
   smoothing:
     enabled: true        # live low-latency 3D keypoint smoothing for angle stability
-    alpha: 0.55          # higher = less smoothing, lower = steadier but more lag
+    alpha: 0.65          # higher = less smoothing, lower = steadier but more lag
     max_gap_s: 0.20      # reset filter after dropped/unsynced frame gaps
+  profiles:
+    precision_4080:
+      model: yolo11x-pose.pt
+      imgsz: 960
+      target_fps: 30
+      conf_thresh: 0.25
+      half: true
+      max_det: 1
+    balanced_4080:
+      model: yolo11m-pose.pt
+      imgsz: 832
+      target_fps: 30
+      conf_thresh: 0.25
+      half: true
+      max_det: 1
+    low_latency:
+      model: yolo11n-pose.pt
+      imgsz: 704
+      target_fps: 30
+      conf_thresh: 0.25
+      half: true
+      max_det: 1
 
 # --------------------------------------------------------------------
 # Gait
@@ -116,6 +143,7 @@ gui:
   height: 950
   plot_window_s: 6.0
   refresh_hz: 60
+  main_overlay_camera: 0      # largest skeleton overlay: cam0 main view
 
 # --------------------------------------------------------------------
 # Recording (mirrors treadmill_opencap_fusion output schema)

@@ -31,6 +31,7 @@ class DearPyGuiApp:
         self.H = int(cfg.get("gui", "height", default=900))
         self.window_s = float(cfg.get("gui", "plot_window_s", default=6.0))
         self.body_mass = cfg.get("calibration", "force", "body_mass_kg") or 82.0
+        self.main_overlay_camera = int(cfg.get("gui", "main_overlay_camera", default=1) or 1)
         self._buf = np.zeros((self.H, self.W, 4), np.float32)
         self._trial_buf = np.zeros((self.H, self.W, 4), np.float32)
         self.dashboard_focus = None
@@ -55,20 +56,30 @@ class DearPyGuiApp:
         self.selected_trial = None
         self.trial_frame = 0
         self.trial_playing = False
+        self._trial_dirty = True
         self._last_trial_tick = 0.0
 
     def _frame_to_rgba(self, bgr):
         h, w = bgr.shape[:2]
         if self._buf.shape[:2] != (h, w):
             self._buf = np.zeros((h, w, 4), np.float32)
-        rgb = bgr[:, :, ::-1].astype(np.float32) / 255.0
-        self._buf[:, :, :3] = rgb
+            self._buf[:, :, 3] = 1.0
+        np.multiply(bgr[:, :, 2], 1.0 / 255.0, out=self._buf[:, :, 0],
+                    casting="unsafe")
+        np.multiply(bgr[:, :, 1], 1.0 / 255.0, out=self._buf[:, :, 1],
+                    casting="unsafe")
+        np.multiply(bgr[:, :, 0], 1.0 / 255.0, out=self._buf[:, :, 2],
+                    casting="unsafe")
         self._buf[:, :, 3] = 1.0
         return self._buf.ravel()
 
     def _image_to_rgba(self, bgr, buf):
-        rgb = bgr[:, :, ::-1].astype(np.float32) / 255.0
-        buf[:, :, :3] = rgb
+        np.multiply(bgr[:, :, 2], 1.0 / 255.0, out=buf[:, :, 0],
+                    casting="unsafe")
+        np.multiply(bgr[:, :, 1], 1.0 / 255.0, out=buf[:, :, 1],
+                    casting="unsafe")
+        np.multiply(bgr[:, :, 0], 1.0 / 255.0, out=buf[:, :, 2],
+                    casting="unsafe")
         buf[:, :, 3] = 1.0
         return buf.ravel()
 
@@ -116,6 +127,10 @@ class DearPyGuiApp:
                 dpg.add_button(label="Arm Recording", callback=self._arm)
                 dpg.add_button(label="Stop+Save", callback=self._save)
                 dpg.add_text("idle", tag="rec_status")
+                dpg.add_text("Skeleton overlay")
+                dpg.add_combo(["cam0", "cam1"], tag="overlay_camera_combo",
+                              default_value=f"cam{self.main_overlay_camera}",
+                              width=90, callback=self._set_overlay_camera)
             # --- treadmill controls (mirror the existing GUI) ---
             with dpg.group(horizontal=True):
                 dpg.add_text("Treadmill")
@@ -163,7 +178,8 @@ class DearPyGuiApp:
                                   window_s=self.window_s,
                                   body_mass_kg=self.body_mass,
                                   focus=self.dashboard_focus,
-                                  layout_controls=self.dashboard_layout_controls)
+                                  layout_controls=self.dashboard_layout_controls,
+                                  overlay_camera=self.main_overlay_camera)
             dpg.set_value(self._dash_texture_tag, self._frame_to_rgba(img))
             dpg.set_value("rec_status",
                           "RECORDING" if self.recorder.armed else "idle")
@@ -263,6 +279,10 @@ class DearPyGuiApp:
                     np.clip(right_w / max(1, w), 0.22, 0.42))
 
     # callbacks
+    def _set_overlay_camera(self, sender=None, app_data=None, *_):
+        value = str(app_data if app_data is not None else "").strip().lower()
+        self.main_overlay_camera = 1 if value == "cam1" else 0
+
     def _start(self, *_):
         self.engine.start()
 
@@ -530,6 +550,7 @@ class DearPyGuiApp:
         self.selected_trial = self.trial_manager.get_trial(item.get("trial_id") or item.get("path"))
         self.trial_frame = 0
         self.trial_playing = False
+        self._trial_dirty = True
         dpg.set_item_label("trial_play_btn", "Play")
         n = max(0, (self.selected_trial.frame_count() - 1) if self.selected_trial else 0)
         dpg.configure_item("trial_frame_slider", max_value=n)
@@ -570,16 +591,19 @@ class DearPyGuiApp:
     def _jump_to_step(self, step):
         import dearpygui.dearpygui as dpg
         self.trial_frame = int(step.get("start_frame") or 0)
+        self._trial_dirty = True
         if dpg.does_item_exist("trial_frame_slider"):
             dpg.set_value("trial_frame_slider", self.trial_frame)
 
     def _set_trial_frame(self, sender, app_data):
         self.trial_frame = int(app_data or 0)
+        self._trial_dirty = True
 
     def _nudge_trial_frame(self, delta):
         import dearpygui.dearpygui as dpg
         max_frame = dpg.get_item_configuration("trial_frame_slider").get("max_value", 0)
         self.trial_frame = int(np.clip(self.trial_frame + delta, 0, max_frame))
+        self._trial_dirty = True
         dpg.set_value("trial_frame_slider", self.trial_frame)
 
     def _toggle_trial_play(self, *_):
@@ -602,6 +626,8 @@ class DearPyGuiApp:
             print("[trials] export failed:", exc)
 
     def _update_trial_texture(self, dpg):
+        if not self.selected_trial:
+            return
         if self.trial_playing and self.selected_trial:
             now = time.time()
             fps = float(self.cfg.get("pose", "target_fps", default=30) or 30)
@@ -611,9 +637,13 @@ class DearPyGuiApp:
                 if dpg.does_item_exist("trial_frame_slider"):
                     dpg.set_value("trial_frame_slider", self.trial_frame)
                 self._last_trial_tick = now
+                self._trial_dirty = True
+        if not (self.trial_playing or self._trial_dirty):
+            return
         img = build_trial_review(self.selected_trial, self.trial_frame,
                                  size=(self.W, self.H))
         dpg.set_value("trial_tex", self._image_to_rgba(img, self._trial_buf))
+        self._trial_dirty = False
 
     # treadmill controls
     def _set_fixed(self, *_):
@@ -657,6 +687,7 @@ def run_cv2_backend(engine, recorder, cfg):
     H = int(cfg.get("gui", "height", default=900))
     window_s = float(cfg.get("gui", "plot_window_s", default=6.0))
     body_mass = cfg.get("calibration", "force", "body_mass_kg") or 82.0
+    main_overlay_camera = int(cfg.get("gui", "main_overlay_camera", default=1) or 1)
     tc = engine.treadmill_ctrl
     target_v, target_a, target_i = 0.0, 0.5, 0.0
     focus = None
@@ -667,7 +698,7 @@ def run_cv2_backend(engine, recorder, cfg):
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
 
     def on_mouse(event, x, y, *_):
-        nonlocal focus, W, H, drag_splitter
+        nonlocal focus, W, H, drag_splitter, main_overlay_camera
         if event == cv2.EVENT_LBUTTONDOWN and not focus:
             drag_splitter = dashboard_resize_hit_test((W, H), (x, y), layout_controls)
             return
@@ -687,7 +718,11 @@ def run_cv2_backend(engine, recorder, cfg):
         if focus:
             focus = None
         else:
-            focus = dashboard_hit_test((W, H), (x, y), layout_controls)
+            hit = dashboard_hit_test((W, H), (x, y), layout_controls)
+            if hit in ("cam0", "cam1"):
+                main_overlay_camera = int(hit[-1])
+            else:
+                focus = hit
 
     cv2.setMouseCallback(win, on_mouse)
     try:
@@ -701,7 +736,8 @@ def run_cv2_backend(engine, recorder, cfg):
             img = build_dashboard(engine.state, size=(W, H),
                                   window_s=window_s, body_mass_kg=body_mass,
                                   focus=focus,
-                                  layout_controls=layout_controls)
+                                  layout_controls=layout_controls,
+                                  overlay_camera=main_overlay_camera)
             cv2.imshow(win, img)
             k = cv2.waitKey(15) & 0xFF
             if k == ord("q"):
