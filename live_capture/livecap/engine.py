@@ -75,6 +75,7 @@ class Engine:
         self.state = SharedState(
             plot_window_s=self.cfg.get("gui", "plot_window_s", default=6.0),
             force_rate_hz=force_rate)
+        self.state.set_stereo_calib(self.stereo)
 
         # treadmill controller (faithful port of the existing GUI controls)
         self.treadmill_ctrl = TreadmillController(
@@ -160,6 +161,7 @@ class Engine:
     def reload_calibration(self):
         self.stereo = load_stereo(self.cfg.abspath(
             self.cfg.get("calibration", "cameras", "extrinsics")))
+        self.state.set_stereo_calib(self.stereo)
         self.state.set_status(calibrated_3d=self.stereo is not None)
         return self.stereo
 

@@ -66,7 +66,8 @@ class CameraSource(_BaseCamera):
     """Live network/USB camera via OpenCV, tuned for low latency."""
 
     def __init__(self, cam_id, url, buffersize=1, ffmpeg_opts="",
-                 transport_latency_s=0.0, width=None, height=None, fps=None):
+                 transport_latency_s=0.0, width=None, height=None, fps=None,
+                 backend=None):
         super().__init__(cam_id, transport_latency_s)
         self.url = url
         self.buffersize = buffersize
@@ -74,13 +75,20 @@ class CameraSource(_BaseCamera):
         self.width_request = width
         self.height_request = height
         self.fps_request = fps
+        self.backend_request = str(backend or "").strip().lower()
 
     def _open(self):
         if self.ffmpeg_opts:
             # OpenCV reads ffmpeg options from this env var (|-separated key;val).
             os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = self.ffmpeg_opts
         src = int(self.url) if str(self.url).isdigit() else self.url
-        if isinstance(src, str):
+        if self.backend_request in ("msmf", "media_foundation"):
+            backend = cv2.CAP_MSMF
+        elif self.backend_request in ("dshow", "directshow"):
+            backend = cv2.CAP_DSHOW
+        elif self.backend_request in ("any", "auto"):
+            backend = cv2.CAP_ANY
+        elif isinstance(src, str):
             backend = cv2.CAP_FFMPEG
         else:
             backend = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY
@@ -158,7 +166,8 @@ def make_cameras(cfg):
                                    transport_latency_s=tol_lat,
                                    width=c.get("width"),
                                    height=c.get("height"),
-                                   fps=c.get("fps"))
+                                   fps=c.get("fps"),
+                                   backend=c.get("backend"))
     else:
         c = cfg.get("cameras", "replay")
         for i, key in enumerate(("cam0", "cam1")):

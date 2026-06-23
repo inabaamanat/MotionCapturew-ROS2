@@ -86,6 +86,31 @@ def _map_kp_to_fit(kp, scale, x0, y0):
     return out
 
 
+def _project_fused_kp_to_camera(kp3d, valid, stereo, cam_id):
+    if kp3d is None or valid is None or stereo is None:
+        return None
+    pts = np.asarray(kp3d, dtype=float)
+    valid = np.asarray(valid, dtype=bool)
+    if pts.ndim != 2 or pts.shape[1] != 3 or valid.shape[0] != pts.shape[0]:
+        return None
+    good = valid & np.all(np.isfinite(pts), axis=1)
+    if not np.any(good):
+        return None
+    out = np.full((pts.shape[0], 3), np.nan, dtype=float)
+    if int(cam_id) == 1:
+        rvec, _ = cv2.Rodrigues(np.asarray(stereo.R, dtype=float))
+        tvec = np.asarray(stereo.T, dtype=float).reshape(3, 1)
+        K, dist = stereo.K1, stereo.dist1
+    else:
+        rvec = np.zeros((3, 1), dtype=float)
+        tvec = np.zeros((3, 1), dtype=float)
+        K, dist = stereo.K0, stereo.dist0
+    proj, _ = cv2.projectPoints(pts[good], rvec, tvec, K, dist)
+    out[good, :2] = proj.reshape(-1, 2)
+    out[good, 2] = 1.0
+    return out
+
+
 def _mid(a, b):
     return ((a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5)
 
@@ -307,7 +332,7 @@ def _draw_crosshair(img, pt, color, r=6):
     cv2.line(img, (x, y - r - 3), (x, y + r + 3), color, 1, cv2.LINE_AA)
 
 
-def draw_precision_pose_overlay(frame, kp, angles):
+def draw_precision_pose_overlay(frame, kp, angles, source_label="measured keypoints"):
     """Draw the measured keypoints/segments, not a stylized anatomy proxy."""
     if kp is None:
         return frame
@@ -349,7 +374,7 @@ def draw_precision_pose_overlay(frame, kp, angles):
                 _text(frame, f"{side} {short} {v:.1f}deg", org, 0.46,
                       _side_color(side), 1)
 
-    _text(frame, "precision overlay: measured keypoints", (12, 22), 0.5, FG, 1)
+    _text(frame, f"precision overlay: {source_label}", (12, 22), 0.5, FG, 1)
     return frame
 
 
@@ -888,12 +913,27 @@ def _camera_panel(img, x, y, w, h, state, ci, angles=None, title=None,
         fitted, scale, ox, oy = _fit_image_with_transform(slot.value, pw, ph)
         kp_is_fresh = kp_s is not None and abs(float(slot.t) - float(kp_s.t)) <= 0.08
         kp = _map_kp_to_fit(kp_s.value, scale, ox, oy) if kp_is_fresh else None
+        fused_kp = None
+        fused_source = False
+        if overlay_style == "precision":
+            kp3d_s, _ = state.kp3d.get()
+            stereo = state.get_stereo_calib()
+            if kp3d_s is not None and abs(float(slot.t) - float(kp3d_s.t)) <= 0.12:
+                pts3d, valid = kp3d_s.value
+                projected = _project_fused_kp_to_camera(pts3d, valid, stereo, ci)
+                if projected is not None:
+                    fused_kp = _map_kp_to_fit(projected, scale, ox, oy)
+                    fused_source = True
         angle_values = angles.value if angles else None
         if overlay_style == "anatomical":
             if not draw_anatomical_overlay_2d(fitted, kp, glow=False):
                 draw_skeleton_2d(fitted, kp, angle_values)
         elif overlay_style == "precision":
-            draw_precision_pose_overlay(fitted, kp, angle_values)
+            draw_precision_pose_overlay(
+                fitted,
+                fused_kp if fused_source else kp,
+                angle_values,
+                "stereo-fused 3D" if fused_source else "single-camera 2D")
         elif overlay_style == "simple":
             draw_skeleton_2d(fitted, kp, angle_values)
     else:

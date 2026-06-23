@@ -62,6 +62,15 @@ class SharedState:
             "treadmill_current_vel": 0.0, "treadmill_incline": 0.0,
             "treadmill_connected": False,
         }
+        self._stereo_calib = None
+
+    def set_stereo_calib(self, calib):
+        with self._lock:
+            self._stereo_calib = calib
+
+    def get_stereo_calib(self):
+        with self._lock:
+            return self._stereo_calib
 
     def set_status(self, **kw):
         with self._lock:

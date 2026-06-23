@@ -35,6 +35,13 @@ Edit `config.yaml`: set `mode: live`, the two `cameras.live` RTSP URLs, the
 force `device`/`channels`, and `calibration.force` (body mass, or the Bertec
 matrix/gains for true Newtons).
 
+### Intel RealSense D435i cameras
+
+The D435i exposes separate Windows camera interfaces for RGB and depth. This
+app records only the two RGB camera interfaces configured as
+`cameras.live.cam0/cam1`; depth, IMU, and native RealSense bag recording are not
+used by the trial pipeline.
+
 ## Calibrate the cameras (required for 3D)
 
 ```bash
@@ -73,9 +80,12 @@ python run_live.py --config config.yaml --session S01_walk_1 --record
 GUI controls: Start/Stop Capture, Arm Recording, Stop+Save.
 Every recording creates a fresh timestamped folder under `recordings/`, so trial
 data is not overwritten.
-Stop+Save also builds the research trial layer automatically: normalized frame
-data, step events, derived metrics, quality metrics, pressure time series,
-summary files, and a `trials_index.json` browser index.
+Stop+Save writes the raw synchronized capture files and queues processing.
+Processing runs automatically when the GUI closes, or immediately from the
+Trials page by right-clicking a trial and choosing **Process**. Live recording
+uses the low-latency pose profile; processing reruns the saved `cam0.mp4` and
+`cam1.mp4` with the offline precision profile before building gait metrics,
+exports, and playback.
 
 ### Treadmill control (full, faithful to the existing GUI)
 
@@ -108,13 +118,17 @@ Mirrors `treadmill_opencap_fusion/output/` so the offline overlay/QC tools run o
 live recordings unchanged:
 
 - `force.npz` — fusion-compatible (`DATA` 14×N, `START`; plus calibrated `CAL`)
-- `pose.npz` — timestamps, 2D keypoints (both cams), 3D keypoints, joint angles
+- `pose.npz` — precision-processed timestamps, 2D keypoints, 3D keypoints, joint angles
+- `pose_live.npz` — original low-latency live pose capture, retained when offline
+  precision processing has run
 - `live_metrics.csv` — per-frame angles + live gait metrics + per-foot GRF/COP
 - `cam0.mp4`, `cam1.mp4` — processed frames (for offline OpenSim if desired)
 - `metadata.json`, `frame_data.npz`, `step_events.json`,
   `derived_metrics.json`, `quality_metrics.json`, `pressure_timeseries.npz`,
   `summary.json` — normalized trial artifacts for browsing, replay, export, and
   rerunning analysis while keeping raw data separate.
+- `playback/skeleton_overlay.mp4` — stitched processed playback with the
+  synchronized high-accuracy skeleton overlay.
 - `exports/` — JSON, CSV, Excel, and binary archive exports from the Trials page.
 
 Programmatic access:

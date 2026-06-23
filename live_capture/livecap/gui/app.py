@@ -11,7 +11,9 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
 import time
+import traceback
 
 import numpy as np
 
@@ -34,6 +36,9 @@ class DearPyGuiApp:
         self.main_overlay_camera = int(cfg.get("gui", "main_overlay_camera", default=1) or 1)
         self._buf = np.zeros((self.H, self.W, 4), np.float32)
         self._trial_buf = np.zeros((self.H, self.W, 4), np.float32)
+        self._trial_texture_size = (self.W, self.H)
+        self._trial_texture_tag = "trial_tex"
+        self._trial_texture_counter = 0
         self.dashboard_focus = None
         self.dashboard_layout_controls = {"left_frac": 0.18, "right_frac": 0.30}
         self._dashboard_drag_splitter = None
@@ -56,8 +61,27 @@ class DearPyGuiApp:
         self.selected_trial = None
         self.trial_frame = 0
         self.trial_playing = False
+        self.trial_chart = "Overview"
+        self.trial_replay_camera = "auto"
+        self.trial_play_speed = 1.0
+        self._trial_play_start_wall = 0.0
+        self._trial_play_start_time = 0.0
         self._trial_dirty = True
         self._last_trial_tick = 0.0
+        self._trial_auto_selected = False
+        self._trial_dragging_timeline = False
+        self._processing_thread = None
+        self._processing_lock = threading.Lock()
+        self._processing_state = {
+            "running": False,
+            "done": False,
+            "error": None,
+            "progress": 0.0,
+            "message": "Idle",
+            "trial_path": None,
+            "result_path": None,
+        }
+        self._processing_notice_consumed = True
 
     def _frame_to_rgba(self, bgr):
         h, w = bgr.shape[:2]
@@ -106,7 +130,7 @@ class DearPyGuiApp:
                                       tag=self._dash_texture_tag)
             trial_tex = dpg.add_raw_texture(self.W, self.H, self._trial_buf.ravel(),
                                             format=dpg.mvFormat_Float_rgba,
-                                            tag="trial_tex")
+                                            tag=self._trial_texture_tag)
             for i, buf in enumerate(self._preview_bufs):
                 dpg.add_raw_texture(self.preview_w, self.preview_h, buf.ravel(),
                                     format=dpg.mvFormat_Float_rgba,
@@ -188,10 +212,16 @@ class DearPyGuiApp:
                           f" m/s ({st.get('treadmill_mode','')})")
             self._update_camera_textures(dpg)
             self._update_calibration_status(dpg)
+            self._update_processing_ui(dpg)
+            self._ensure_trial_texture(dpg)
+            self._handle_trial_image_input(dpg)
             self._update_trial_texture(dpg)
             dpg.render_dearpygui_frame()
 
         self._stop()
+        if self._processing_thread and self._processing_thread.is_alive():
+            self._processing_thread.join()
+        self._process_pending_trials(show_status=False)
         self._close_all_previews()
         dpg.destroy_context()
 
@@ -295,6 +325,12 @@ class DearPyGuiApp:
     def _save(self, *_):
         out = self.recorder.stop_and_save()
         print("saved recording ->", out)
+        try:
+            import dearpygui.dearpygui as dpg
+            if dpg.does_item_exist("rec_status"):
+                dpg.set_value("rec_status", "saved raw; processing queued")
+        except Exception:
+            pass
         self._refresh_trials()
 
     # cameras page
@@ -486,10 +522,13 @@ class DearPyGuiApp:
     def _build_trials_page(self, dpg, trial_tex):
         with dpg.group(horizontal=True):
             with dpg.child_window(width=520, height=self.H - 120, tag="trial_browser"):
+                dpg.add_text(str(self.trial_manager.recordings_dir), tag="trial_root_text",
+                             wrap=500)
                 with dpg.group(horizontal=True):
                     dpg.add_input_text(tag="trial_search", hint="Search trials", width=300,
                                        callback=lambda *_: self._refresh_trials())
                     dpg.add_button(label="Refresh", callback=lambda *_: self._refresh_trials())
+                    dpg.add_button(label="Load Latest", callback=self._load_latest_trial)
                 dpg.add_spacer(height=6)
                 dpg.add_child_window(tag="trial_table_host", height=360, border=False)
                 dpg.add_separator()
@@ -502,6 +541,21 @@ class DearPyGuiApp:
                     dpg.add_button(label=">", callback=lambda *_: self._nudge_trial_frame(1))
                     dpg.add_slider_int(tag="trial_frame_slider", min_value=0, max_value=0,
                                        default_value=0, width=360, callback=self._set_trial_frame)
+                    dpg.add_text("0.00s / 0.00s", tag="trial_time_text")
+                    dpg.add_combo(["0.25x", "0.5x", "1x", "2x"], tag="trial_speed_combo",
+                                  default_value="1x", width=75,
+                                  callback=self._set_trial_play_speed)
+                    dpg.add_combo(self._chart_options(), tag="trial_chart_combo",
+                                  default_value="Overview", width=190,
+                                  callback=self._set_trial_chart)
+                    dpg.add_combo(["auto", "cam0", "cam1"], tag="trial_replay_camera_combo",
+                                  default_value="auto", width=90,
+                                  callback=self._set_trial_replay_camera)
+                    dpg.add_button(label="Prev Chart", callback=lambda *_: self._cycle_trial_chart(-1))
+                    dpg.add_button(label="Next Chart", callback=lambda *_: self._cycle_trial_chart(1))
+                    dpg.add_button(label="Process", tag="trial_process_btn",
+                                   callback=self._process_selected_trial)
+                    dpg.add_button(label="Open Overlay", callback=self._open_selected_overlay)
                     dpg.add_combo(["both", "raw", "processed"], tag="export_scope",
                                   default_value="both", width=120)
                     dpg.add_button(label="JSON", callback=lambda *_: self._export_trial("json"))
@@ -509,7 +563,12 @@ class DearPyGuiApp:
                     dpg.add_button(label="Excel", callback=lambda *_: self._export_trial("excel"))
                     dpg.add_button(label="Archive", callback=lambda *_: self._export_trial("archive"))
                 dpg.add_text("Select a trial", tag="trial_status")
-                dpg.add_image(trial_tex)
+                with dpg.group(horizontal=True):
+                    dpg.add_progress_bar(default_value=0.0, width=360,
+                                         tag="trial_processing_bar")
+                    dpg.add_text("Idle", tag="trial_processing_text")
+                dpg.add_image(trial_tex, tag="trial_image",
+                              width=self.W, height=self.H)
         self._refresh_trials()
 
     def _refresh_trials(self):
@@ -521,19 +580,36 @@ class DearPyGuiApp:
         dpg.delete_item("trial_table_host", children_only=True)
         with dpg.table(parent="trial_table_host", header_row=True, resizable=True,
                        borders_innerH=True, borders_innerV=False, borders_outerH=True):
-            for name in ("Trial name", "Date", "Duration", "Steps", "Distance", "Speed", "Cadence"):
+            for name in ("Trial name", "Status", "Date", "Duration", "Steps", "Distance", "Speed", "Cadence"):
                 dpg.add_table_column(label=name)
-            for item in self.trials:
+            for row_idx, item in enumerate(self.trials):
                 with dpg.table_row():
                     label = item.get("recording_name") or item.get("path")
-                    dpg.add_button(label=str(label), width=150,
+                    tag = f"trial_select_{row_idx}"
+                    dpg.add_button(label=str(label), tag=tag, width=150,
                                    callback=lambda s, a, u=item: self._select_trial(u))
+                    with dpg.popup(tag, mousebutton=dpg.mvMouseButton_Right):
+                        dpg.add_button(label="Select",
+                                       callback=lambda s, a, u=item: self._select_trial(u))
+                        dpg.add_button(label="Process",
+                                       callback=lambda s, a, u=item: self._process_trial_item(u))
+                    dpg.add_text(str(item.get("status") or "raw_saved"))
                     dpg.add_text(str(item.get("date_time") or "")[:19])
                     dpg.add_text(self._fmt_ui(item.get("duration_s"), "s"))
                     dpg.add_text(str(item.get("total_steps") or 0))
                     dpg.add_text(self._fmt_ui(item.get("distance_m"), "m"))
                     dpg.add_text(self._fmt_ui(item.get("average_speed_m_s"), "m/s"))
                     dpg.add_text(self._fmt_ui(item.get("average_cadence_steps_per_min"), "/min", 0))
+        if self.trials and not self.selected_trial and not self._trial_auto_selected:
+            self._trial_auto_selected = True
+            self._select_trial(self.trials[0])
+        elif not self.trials and dpg.does_item_exist("trial_status"):
+            dpg.set_value("trial_status", "No trials found in the active recordings folder.")
+
+    def _load_latest_trial(self, *_):
+        self._refresh_trials()
+        if self.trials:
+            self._select_trial(self.trials[0])
 
     @staticmethod
     def _fmt_ui(value, suffix="", digits=1):
@@ -550,8 +626,18 @@ class DearPyGuiApp:
         self.selected_trial = self.trial_manager.get_trial(item.get("trial_id") or item.get("path"))
         self.trial_frame = 0
         self.trial_playing = False
+        self.trial_chart = "Overview"
+        self.trial_replay_camera = "auto"
+        self._trial_play_start_wall = 0.0
+        self._trial_play_start_time = 0.0
         self._trial_dirty = True
         dpg.set_item_label("trial_play_btn", "Play")
+        if dpg.does_item_exist("trial_chart_combo"):
+            dpg.set_value("trial_chart_combo", self.trial_chart)
+        if dpg.does_item_exist("trial_replay_camera_combo"):
+            dpg.set_value("trial_replay_camera_combo", self.trial_replay_camera)
+        if dpg.does_item_exist("trial_speed_combo"):
+            dpg.set_value("trial_speed_combo", f"{self.trial_play_speed:g}x")
         n = max(0, (self.selected_trial.frame_count() - 1) if self.selected_trial else 0)
         dpg.configure_item("trial_frame_slider", max_value=n)
         dpg.set_value("trial_frame_slider", 0)
@@ -564,6 +650,7 @@ class DearPyGuiApp:
                 f"{summ.get('total_steps', 0)} steps | "
                 f"{self._fmt_ui(summ.get('recording_duration_s'), 's')}",
             )
+            self._update_trial_texture(dpg)
         self._rebuild_step_table()
 
     def _rebuild_step_table(self):
@@ -597,20 +684,270 @@ class DearPyGuiApp:
 
     def _set_trial_frame(self, sender, app_data):
         self.trial_frame = int(app_data or 0)
+        self._reset_trial_play_anchor()
         self._trial_dirty = True
 
     def _nudge_trial_frame(self, delta):
         import dearpygui.dearpygui as dpg
         max_frame = dpg.get_item_configuration("trial_frame_slider").get("max_value", 0)
         self.trial_frame = int(np.clip(self.trial_frame + delta, 0, max_frame))
+        self._reset_trial_play_anchor()
         self._trial_dirty = True
         dpg.set_value("trial_frame_slider", self.trial_frame)
 
     def _toggle_trial_play(self, *_):
         import dearpygui.dearpygui as dpg
         self.trial_playing = not self.trial_playing
+        self._reset_trial_play_anchor()
         self._last_trial_tick = time.time()
         dpg.set_item_label("trial_play_btn", "Pause" if self.trial_playing else "Play")
+
+    def _set_trial_play_speed(self, sender=None, app_data=None, *_):
+        text = str(app_data or "1x").strip().lower().replace("x", "")
+        try:
+            self.trial_play_speed = max(0.05, float(text))
+        except Exception:
+            self.trial_play_speed = 1.0
+        self._reset_trial_play_anchor()
+
+    def _trial_timestamps(self):
+        if not self.selected_trial:
+            return np.zeros(0)
+        frames = self.selected_trial.frames
+        return np.asarray(frames.get("timestamp", []), float)
+
+    def _trial_duration(self):
+        if not self.selected_trial:
+            return 0.0
+        try:
+            duration = float(self.selected_trial.summary.get("recording_duration_s") or 0.0)
+        except Exception:
+            duration = 0.0
+        ts = self._trial_timestamps()
+        if duration <= 0 and ts.size:
+            duration = float(np.nanmax(ts))
+        return max(0.0, duration)
+
+    def _trial_time_for_frame(self, frame_idx=None):
+        ts = self._trial_timestamps()
+        if ts.size == 0:
+            return 0.0
+        idx = int(np.clip(self.trial_frame if frame_idx is None else frame_idx, 0, ts.size - 1))
+        return float(ts[idx])
+
+    def _frame_for_trial_time(self, target_t):
+        ts = self._trial_timestamps()
+        if ts.size == 0:
+            return 0
+        idx = int(np.clip(np.searchsorted(ts, target_t, side="left"), 0, ts.size - 1))
+        if idx > 0 and abs(ts[idx - 1] - target_t) <= abs(ts[idx] - target_t):
+            idx -= 1
+        return idx
+
+    def _reset_trial_play_anchor(self):
+        self._trial_play_start_wall = time.time()
+        self._trial_play_start_time = self._trial_time_for_frame()
+
+    @staticmethod
+    def _chart_options():
+        return [
+            "Overview",
+            "Camera skeleton replay",
+            "Walking speed vs time",
+            "Cadence vs time",
+            "Stride length vs step",
+            "Step length vs step",
+            "Joint angles over time",
+            "Center of mass trajectory",
+            "Foot trajectories",
+            "Pressure over time",
+            "Ground contact timeline",
+            "Left vs right symmetry",
+        ]
+
+    def _set_trial_chart(self, sender=None, app_data=None, *_):
+        self.trial_chart = str(app_data or "Overview")
+        self._trial_dirty = True
+
+    def _set_trial_replay_camera(self, sender=None, app_data=None, *_):
+        self.trial_replay_camera = str(app_data or "auto")
+        self._trial_dirty = True
+
+    def _cycle_trial_chart(self, delta):
+        import dearpygui.dearpygui as dpg
+        opts = self._chart_options()
+        try:
+            i = opts.index(self.trial_chart)
+        except ValueError:
+            i = 0
+        self.trial_chart = opts[(i + int(delta)) % len(opts)]
+        if dpg.does_item_exist("trial_chart_combo"):
+            dpg.set_value("trial_chart_combo", self.trial_chart)
+        self._trial_dirty = True
+
+    def _process_selected_trial(self, *_):
+        if self.selected_trial:
+            self._process_trial(self.selected_trial)
+
+    def _open_selected_overlay(self, *_):
+        import dearpygui.dearpygui as dpg
+        if not self.selected_trial:
+            return
+        rel = self.selected_trial.metadata.get("paths", {}).get("playback_video")
+        path = self.selected_trial.path / rel if rel else self.selected_trial.path / "playback" / "skeleton_overlay.mp4"
+        if not path.exists():
+            if dpg.does_item_exist("trial_status"):
+                dpg.set_value("trial_status", "No processed overlay video found for this trial.")
+            return
+        try:
+            os.startfile(path)
+        except Exception as exc:
+            if dpg.does_item_exist("trial_status"):
+                dpg.set_value("trial_status", f"Could not open overlay: {exc}")
+
+    def _process_trial_item(self, item):
+        trial = self.trial_manager.get_trial(item.get("trial_id") or item.get("path"))
+        if trial:
+            self._process_trial(trial)
+
+    def _process_trial(self, trial):
+        import dearpygui.dearpygui as dpg
+        if self._is_processing():
+            if dpg.does_item_exist("trial_status"):
+                dpg.set_value("trial_status", "Processing is already running.")
+            return
+        label = trial.metadata.get("recording_name", trial.path.name)
+        if dpg.does_item_exist("trial_status"):
+            dpg.set_value("trial_status", f"Processing {label}...")
+        self._set_processing_state(
+            running=True, done=False, error=None, progress=0.02,
+            message=f"Queued {label}", trial_path=str(trial.path),
+            result_path=None)
+        self._processing_notice_consumed = False
+        if dpg.does_item_exist("trial_process_btn"):
+            dpg.configure_item("trial_process_btn", enabled=False)
+        self._processing_thread = threading.Thread(
+            target=self._process_trial_worker, args=(trial.path,),
+            daemon=True, name="trial-processing")
+        self._processing_thread.start()
+
+    def _process_trial_worker(self, trial_path):
+        print(f"[trials] processing -> {trial_path}")
+        log_path = trial_path / "processing.log"
+        try:
+            def progress(stage, current=0, total=1, message=""):
+                frac = self._processing_fraction(stage, current, total)
+                self._set_processing_state(
+                    running=True, done=False, error=None, progress=frac,
+                    message=message or stage, trial_path=str(trial_path))
+                try:
+                    with open(log_path, "a", encoding="utf-8") as fh:
+                        fh.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} "
+                                 f"{stage} {current}/{total} {message}\n")
+                except Exception:
+                    pass
+
+            processed = self.trial_manager.process_trial(
+                str(trial_path.name), self.cfg, progress=progress)
+            self._set_processing_state(
+                running=False, done=True, error=None, progress=1.0,
+                message="Processing complete",
+                trial_path=str(trial_path),
+                result_path=str(processed.path) if processed else None)
+        except Exception as exc:
+            tb = traceback.format_exc()
+            try:
+                with open(log_path, "a", encoding="utf-8") as fh:
+                    fh.write(tb)
+            except Exception:
+                pass
+            print("[trials] processing failed:", exc)
+            print(tb)
+            self._set_processing_state(
+                running=False, done=True, error=str(exc), progress=0.0,
+                message=f"Processing failed: {exc}",
+                trial_path=str(trial_path), result_path=None)
+
+    @staticmethod
+    def _processing_fraction(stage, current, total):
+        total = max(1.0, float(total or 1))
+        current = float(current or 0)
+        within = float(np.clip(current / total, 0.0, 1.0))
+        ranges = {
+            "start": (0.00, 0.03),
+            "load_model": (0.03, 0.12),
+            "precision_pose": (0.12, 0.78),
+            "artifacts": (0.78, 0.88),
+            "playback": (0.88, 0.98),
+            "complete": (0.98, 1.00),
+        }
+        lo, hi = ranges.get(stage, (0.02, 0.98))
+        return float(lo + (hi - lo) * within)
+
+    def _set_processing_state(self, **updates):
+        with self._processing_lock:
+            self._processing_state.update(updates)
+
+    def _get_processing_state(self):
+        with self._processing_lock:
+            return dict(self._processing_state)
+
+    def _is_processing(self):
+        return bool(self._get_processing_state().get("running"))
+
+    def _update_processing_ui(self, dpg):
+        state = self._get_processing_state()
+        if dpg.does_item_exist("trial_processing_bar"):
+            dpg.set_value("trial_processing_bar",
+                          float(np.clip(state.get("progress", 0.0), 0.0, 1.0)))
+        if dpg.does_item_exist("trial_processing_text"):
+            pct = int(round(float(state.get("progress", 0.0)) * 100))
+            msg = state.get("message") or "Idle"
+            dpg.set_value("trial_processing_text", f"{pct}%  {msg}")
+        if dpg.does_item_exist("trial_process_btn"):
+            dpg.configure_item("trial_process_btn", enabled=not state.get("running"))
+        if state.get("done") and not self._processing_notice_consumed:
+            self._processing_notice_consumed = True
+            if state.get("error"):
+                if dpg.does_item_exist("trial_status"):
+                    dpg.set_value("trial_status", state.get("message"))
+                return
+            result_path = state.get("result_path")
+            if result_path:
+                self.selected_trial = self.trial_manager.get_trial(os.path.basename(result_path))
+                self.trial_frame = 0
+                self.trial_playing = False
+                self._trial_dirty = True
+                self._refresh_trials()
+                self._rebuild_step_table()
+                if self.selected_trial and dpg.does_item_exist("trial_frame_slider"):
+                    dpg.configure_item("trial_frame_slider",
+                                       max_value=max(0, self.selected_trial.frame_count() - 1))
+                    dpg.set_value("trial_frame_slider", 0)
+                if self.selected_trial and dpg.does_item_exist("trial_status"):
+                    path = self.selected_trial.metadata.get("paths", {}).get("playback_video")
+                    suffix = f" | playback: {path}" if path else ""
+                    dpg.set_value("trial_status", f"Processing complete{suffix}")
+
+    def _process_pending_trials(self, show_status=True):
+        try:
+            pending = self.trial_manager.pending_trials()
+        except Exception as exc:
+            print("[trials] could not list pending trials:", exc)
+            return
+        if not pending:
+            return
+        if show_status:
+            import dearpygui.dearpygui as dpg
+            if dpg.does_item_exist("trial_status"):
+                dpg.set_value("trial_status", f"Processing {len(pending)} pending trial(s)...")
+        print(f"[trials] processing {len(pending)} pending trial(s) before close")
+        for trial in pending:
+            try:
+                self.trial_manager.process_trial(trial, self.cfg)
+            except Exception as exc:
+                print(f"[trials] pending processing failed for {trial.path}: {exc}")
+        self._refresh_trials()
 
     def _export_trial(self, fmt):
         import dearpygui.dearpygui as dpg
@@ -630,20 +967,118 @@ class DearPyGuiApp:
             return
         if self.trial_playing and self.selected_trial:
             now = time.time()
-            fps = float(self.cfg.get("pose", "target_fps", default=30) or 30)
-            if now - self._last_trial_tick >= 1.0 / fps:
-                max_frame = max(0, self.selected_trial.frame_count() - 1)
-                self.trial_frame = 0 if self.trial_frame >= max_frame else self.trial_frame + 1
+            target_t = self._trial_play_start_time + (
+                now - self._trial_play_start_wall) * self.trial_play_speed
+            duration = self._trial_duration()
+            if duration > 0 and target_t > duration:
+                target_t = 0.0
+                self._trial_play_start_time = 0.0
+                self._trial_play_start_wall = now
+            new_frame = self._frame_for_trial_time(target_t)
+            if new_frame != self.trial_frame or now - self._last_trial_tick >= 0.25:
+                self.trial_frame = new_frame
                 if dpg.does_item_exist("trial_frame_slider"):
                     dpg.set_value("trial_frame_slider", self.trial_frame)
                 self._last_trial_tick = now
                 self._trial_dirty = True
+        self._update_trial_time_text(dpg)
         if not (self.trial_playing or self._trial_dirty):
             return
+        tw, th = self._trial_texture_size
         img = build_trial_review(self.selected_trial, self.trial_frame,
-                                 size=(self.W, self.H))
-        dpg.set_value("trial_tex", self._image_to_rgba(img, self._trial_buf))
+                                 size=(tw, th),
+                                 chart_name=self.trial_chart,
+                                 replay_camera=self.trial_replay_camera)
+        dpg.set_value(self._trial_texture_tag, self._image_to_rgba(img, self._trial_buf))
         self._trial_dirty = False
+
+    def _update_trial_time_text(self, dpg):
+        if not dpg.does_item_exist("trial_time_text"):
+            return
+        cur = self._trial_time_for_frame()
+        duration = self._trial_duration()
+        dpg.set_value("trial_time_text", f"{cur:.2f}s / {duration:.2f}s")
+
+    def _handle_trial_image_input(self, dpg):
+        if not (self.selected_trial and dpg.does_item_exist("trial_image")):
+            self._trial_dragging_timeline = False
+            return
+        try:
+            hovered = dpg.is_item_hovered("trial_image")
+            clicked = dpg.is_mouse_button_clicked(button=dpg.mvMouseButton_Left)
+            down = dpg.is_mouse_button_down(button=dpg.mvMouseButton_Left)
+            released = dpg.is_mouse_button_released(button=dpg.mvMouseButton_Left)
+        except Exception:
+            return
+        if released:
+            self._trial_dragging_timeline = False
+            return
+        if not (hovered or self._trial_dragging_timeline):
+            return
+        mx, my = dpg.get_mouse_pos(local=False)
+        ix, iy = dpg.get_item_rect_min("trial_image")
+        lx, ly = mx - ix, my - iy
+        tw, th = self._trial_texture_size
+        timeline = (20, 140, max(1, tw - 40), 86)
+        tx, ty, twidth, theight = timeline
+        inside_timeline = tx <= lx <= tx + twidth and ty <= ly <= ty + theight
+        if clicked and inside_timeline:
+            self._trial_dragging_timeline = True
+        if self._trial_dragging_timeline and down:
+            self._jump_to_timeline_x(lx)
+
+    def _jump_to_timeline_x(self, local_x):
+        import dearpygui.dearpygui as dpg
+        frames = self.selected_trial.frames if self.selected_trial else {}
+        ts = np.asarray(frames.get("timestamp", []), float)
+        if ts.size == 0:
+            return
+        tw, _ = self._trial_texture_size
+        px = 36.0
+        pw = max(1.0, float(tw - 72))
+        frac = float(np.clip((local_x - px) / pw, 0.0, 1.0))
+        duration = float(self.selected_trial.summary.get("recording_duration_s") or np.nanmax(ts) or 0.0)
+        target_t = frac * max(duration, 0.0)
+        idx = int(np.clip(np.searchsorted(ts, target_t, side="left"), 0, ts.size - 1))
+        if idx > 0 and abs(ts[idx - 1] - target_t) <= abs(ts[idx] - target_t):
+            idx -= 1
+        self.trial_frame = idx
+        self.trial_playing = False
+        self._trial_dirty = True
+        if dpg.does_item_exist("trial_frame_slider"):
+            dpg.set_value("trial_frame_slider", self.trial_frame)
+        if dpg.does_item_exist("trial_play_btn"):
+            dpg.set_item_label("trial_play_btn", "Play")
+
+    def _ensure_trial_texture(self, dpg):
+        if not dpg.does_item_exist("trial_detail"):
+            return
+        try:
+            w, h = dpg.get_item_rect_size("trial_detail")
+        except Exception:
+            return
+        w = max(700, int(w or self.W))
+        h = max(500, int((h or self.H) - 54))
+        if self._trial_texture_size == (w, h):
+            return
+        self._trial_texture_size = (w, h)
+        self._trial_buf = np.zeros((h, w, 4), np.float32)
+        old_tag = self._trial_texture_tag
+        self._trial_texture_counter += 1
+        self._trial_texture_tag = f"trial_tex_{self._trial_texture_counter}"
+        dpg.add_raw_texture(w, h, self._trial_buf.ravel(),
+                            format=dpg.mvFormat_Float_rgba,
+                            tag=self._trial_texture_tag,
+                            parent="texture_registry")
+        if dpg.does_item_exist("trial_image"):
+            dpg.configure_item("trial_image", texture_tag=self._trial_texture_tag,
+                               width=w, height=h)
+        if dpg.does_item_exist(old_tag):
+            try:
+                dpg.delete_item(old_tag)
+            except Exception:
+                pass
+        self._trial_dirty = True
 
     # treadmill controls
     def _set_fixed(self, *_):
@@ -769,4 +1204,13 @@ def run_cv2_backend(engine, recorder, cfg):
                     tc.start_self_paced(initial_vel=target_v)
     finally:
         engine.stop()
+        try:
+            mgr = RecordingDataManager(cfg.abspath(cfg.get("recording", "output_dir",
+                                                          default="recordings")))
+            pending = mgr.pending_trials()
+            if pending:
+                print(f"[trials] processing {len(pending)} pending trial(s) before close")
+                mgr.process_pending(cfg)
+        except Exception as exc:
+            print("[trials] pending processing failed:", exc)
         cv2.destroyAllWindows()

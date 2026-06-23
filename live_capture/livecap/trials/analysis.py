@@ -96,6 +96,10 @@ def _gradient(x: np.ndarray, t: np.ndarray) -> np.ndarray:
     tt = np.asarray(t, float)
     if np.nanmax(tt) - np.nanmin(tt) <= 1e-9:
         return np.full_like(x, np.nan, dtype=float)
+    if np.any(np.diff(tt) <= 1e-9):
+        positive = np.diff(tt)[np.diff(tt) > 1e-9]
+        dt = float(np.nanmedian(positive)) if positive.size else 1.0
+        tt = tt[0] + np.arange(tt.size, dtype=float) * max(dt, 1e-6)
     return np.gradient(x, tt, axis=0, edge_order=1)
 
 
@@ -408,6 +412,7 @@ def _summary(metadata: dict[str, Any], steps: list[dict[str, Any]]) -> dict[str,
 
 def build_trial_artifacts(recording_dir: str | os.PathLike, cfg) -> dict[str, Any]:
     """Create normalized trial files and return the metadata payload."""
+    processing_t0 = time.perf_counter()
     rec_dir = Path(recording_dir)
     rec_dir.mkdir(parents=True, exist_ok=True)
     (rec_dir / "raw").mkdir(exist_ok=True)
@@ -431,6 +436,16 @@ def build_trial_artifacts(recording_dir: str | os.PathLike, cfg) -> dict[str, An
     valid = np.asarray(pose.get("valid", np.isfinite(kp3d[:, :, 0]) if kp3d.size else np.zeros((0, len(COCO_NAMES)), bool)), bool)
     kp0 = np.asarray(pose.get("kp0", np.zeros((kp3d.shape[0], len(COCO_NAMES), 3))), float)
     kp1 = np.asarray(pose.get("kp1", np.zeros_like(kp0)), float)
+    offline_precision = bool(np.asarray(pose.get("offline_precision", False)).item()
+                             if "offline_precision" in pose else False)
+    offline_model = str(np.asarray(pose.get("offline_pose_model", "")).item()
+                        if "offline_pose_model" in pose else "")
+    offline_profile = str(np.asarray(pose.get("offline_pose_profile", "")).item()
+                          if "offline_pose_profile" in pose else "")
+    offline_imgsz = (int(np.asarray(pose.get("offline_pose_imgsz")).item())
+                     if "offline_pose_imgsz" in pose else None)
+    offline_seconds = (float(np.asarray(pose.get("offline_processing_seconds")).item())
+                       if "offline_processing_seconds" in pose else 0.0)
     conf = _camera_confidence(kp0, kp1)
     tracking_conf = np.nanmean(conf, axis=1) if conf.size else np.zeros(0)
     pelvis, body, com = _pelvis_and_body(kp3d)
@@ -510,7 +525,10 @@ def build_trial_artifacts(recording_dir: str | os.PathLike, cfg) -> dict[str, An
             "target": cfg.get("pose", "target_fps", default=30),
         },
         "recording_fps": _safe_float(frame_t.size / duration) if duration > 0 else None,
-        "tracking_model_version": cfg.get("pose", "model", default="unknown"),
+        "tracking_model_version": offline_model or cfg.get("pose", "model", default="unknown"),
+        "tracking_profile": offline_profile or cfg.get("pose", "profile", default="custom"),
+        "offline_precision_processing": offline_precision,
+        "offline_pose_imgsz": offline_imgsz,
         "camera_calibration": {
             "extrinsics": cfg.path("calibration", "cameras", "extrinsics"),
             "frame_pair_tolerance_s": cfg.get("cameras", "frame_pair_tolerance_s", default=None),
@@ -518,7 +536,8 @@ def build_trial_artifacts(recording_dir: str | os.PathLike, cfg) -> dict[str, An
         "walking_condition": cfg.get("recording", "walking_condition", default=None),
         "surface_type": cfg.get("recording", "surface_type", default="treadmill"),
         "shoe_type": cfg.get("recording", "shoe_type", default=None),
-        "processing_latency_ms": _safe_float(_finite_mean(frame_data["quality_processing_latency_ms"])),
+        "processing_latency_ms": None,
+        "status": "processed",
         "paths": {
             "raw_force": "force.npz",
             "raw_pose": "pose.npz",
@@ -530,7 +549,6 @@ def build_trial_artifacts(recording_dir: str | os.PathLike, cfg) -> dict[str, An
         },
         "schema_version": "trial-recording-v1",
     }
-    _write_json(meta_path, metadata)
 
     quality = {
         "tracking_confidence_mean": _safe_float(_finite_mean(tracking_conf)),
@@ -569,10 +587,19 @@ def build_trial_artifacts(recording_dir: str | os.PathLike, cfg) -> dict[str, An
         {"kind": "pose_landmarks", "path": "../pose.npz"},
         {"kind": "metrics_stream", "path": "../live_metrics.csv"},
     ]
+    if (rec_dir / "pose_live.npz").exists():
+        raw_files.append({"kind": "live_pose_landmarks", "path": "../pose_live.npz"})
+        metadata["paths"]["live_pose"] = "pose_live.npz"
+    if (rec_dir / "pose_precision.npz").exists():
+        raw_files.append({"kind": "precision_pose_landmarks", "path": "../pose_precision.npz"})
+        metadata["paths"]["precision_pose"] = "pose_precision.npz"
     if (rec_dir / "cam0.mp4").exists():
         raw_files.append({"kind": "video_cam0", "path": "../cam0.mp4"})
     if (rec_dir / "cam1.mp4").exists():
         raw_files.append({"kind": "video_cam1", "path": "../cam1.mp4"})
+    metadata["processing_latency_ms"] = _safe_float(
+        (offline_seconds + (time.perf_counter() - processing_t0)) * 1000.0)
+    _write_json(meta_path, metadata)
     _write_json(rec_dir / "raw" / "manifest.json", {
         "raw_files": raw_files,
         "note": "Derived artifacts can be regenerated from these raw capture files.",
@@ -620,6 +647,7 @@ def _update_index(recordings_dir: Path):
                 "recording_name": meta.get("recording_name") or meta_path.parent.name,
                 "date_time": meta.get("date_time"),
                 "path": meta_path.parent.name,
+                "status": meta.get("status"),
                 "duration_s": summary.get("recording_duration_s", meta.get("duration_s")),
                 "total_steps": summary.get("total_steps"),
                 "distance_m": summary.get("total_distance_walked_m"),

@@ -156,7 +156,7 @@ class Recorder:
         w.write(frame)
 
     # ---- finalize ----
-    def stop_and_save(self):
+    def stop_and_save(self, process=False):
         if not self.armed:
             return None
         self.armed = False
@@ -164,16 +164,52 @@ class Recorder:
             w.release()
         self._writers = {}
         if not self.f_t and not self.p_t:
+            self._mark_raw_saved()
             return self.out_dir
 
         self._save_force()
         self._save_pose()
         self._save_csv()
-        try:
-            build_trial_artifacts(self.out_dir, self.cfg)
-        except Exception as exc:
-            print(f"[recorder] trial artifact build failed: {exc}")
+        self._mark_raw_saved()
+        if process:
+            try:
+                build_trial_artifacts(self.out_dir, self.cfg)
+            except Exception as exc:
+                print(f"[recorder] trial artifact build failed: {exc}")
         return self.out_dir
+
+    def _mark_raw_saved(self):
+        if not self.out_dir:
+            return
+        path = os.path.join(self.out_dir, "metadata.json")
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                meta = json.load(fh)
+        except Exception:
+            meta = {
+                "session_id": self.session_id,
+                "trial_id": self.trial_id,
+                "recording_name": os.path.basename(self.out_dir),
+                "schema_version": "trial-recording-v1",
+            }
+        duration = 0.0
+        if self.start_epoch is not None:
+            last = max(self.p_t[-1] if self.p_t else self.start_epoch,
+                       self.f_t[-1] if self.f_t else self.start_epoch)
+            duration = float(last - self.start_epoch)
+        meta.update({
+            "status": "raw_saved",
+            "duration_s": duration,
+            "raw_saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "raw_files": {
+                "force": "force.npz" if os.path.exists(os.path.join(self.out_dir, "force.npz")) else None,
+                "pose": "pose.npz" if os.path.exists(os.path.join(self.out_dir, "pose.npz")) else None,
+                "cam0": "cam0.mp4" if os.path.exists(os.path.join(self.out_dir, "cam0.mp4")) else None,
+                "cam1": "cam1.mp4" if os.path.exists(os.path.join(self.out_dir, "cam1.mp4")) else None,
+            },
+        })
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(meta, fh, indent=2)
 
     def _save_force(self):
         if not self.f_t:

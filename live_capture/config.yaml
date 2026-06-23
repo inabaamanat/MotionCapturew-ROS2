@@ -15,8 +15,9 @@ mode: live          # replay | live
 cameras:
   # LIVE: USB cameras via OpenCV device indices.
   live:
-    cam0: "0"
+    cam0: "2"
     cam1: "4"
+    backend: msmf
     # OpenCV latency tuning (applied by CameraSource):
     width: 1280
     height: 720
@@ -89,12 +90,12 @@ pose:
   #   precision_4080  -> best joint localization using the RTX 4080, more GPU load
   #   balanced_4080   -> strong accuracy with lower latency
   #   low_latency     -> original tiny model for fastest feedback
-  profile: balanced_4080
-  model: yolo11m-pose.pt
+  profile: low_latency
+  model: yolo11n-pose.pt
   device: cuda          # cuda on the capture PC; cpu fallback elsewhere
   conf_thresh: 0.25
   target_fps: 30        # USB cameras are currently configured at 30 fps
-  imgsz: 832             # higher input size improves joint localization
+  imgsz: 704             # live setting favors low latency; offline pass is higher precision
   half: true             # FP16 on CUDA for lower latency
   max_det: 1             # only track the primary subject
   fuse: true             # fuse model layers at startup where supported
@@ -129,6 +130,27 @@ pose:
       max_det: 1
 
 # --------------------------------------------------------------------
+# Offline processing (runs after Stop+Save when a trial is processed)
+# --------------------------------------------------------------------
+offline_processing:
+  enabled: true
+  profile: precision_4080
+  model: yolo11x-pose.pt
+  device: cuda
+  imgsz: 960
+  conf_thresh: 0.20
+  half: true
+  max_det: 1
+  fuse: true
+  warmup: true
+  warmup_shape: [720, 1280]
+  warmup_batch: 2
+  smoothing:
+    enabled: true
+    alpha: 0.45
+    max_gap_s: 0.35
+
+# --------------------------------------------------------------------
 # Gait
 # --------------------------------------------------------------------
 gait:
@@ -149,7 +171,7 @@ gui:
 # Recording (mirrors treadmill_opencap_fusion output schema)
 # --------------------------------------------------------------------
 recording:
-  output_dir: recordings
+  output_dir: "C:/Users/rishu/OneDrive - The University of Texas at Austin/LiveCaptureRecordings"
   save_raw_video: true
   buffer_minutes: 10
   subject_id: null
