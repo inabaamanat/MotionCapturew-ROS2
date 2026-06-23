@@ -1,0 +1,55 @@
+# Python
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.claude/settings.local.json
+
+# Generated captures and analysis outputs
+live_capture/recordings/
+live_capture/usb_probe/
+live_capture/calib/backup_*/
+treadmill_opencap_fusion/output/
+OpenCapData_*/
+
+# Large or generated data/model artifacts
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.npz
+*.parquet
+*.xlsx
+*.zip
+*.pt
+*.asv
+
+# Vendor/install binaries
+*.exe
+*.dll
+*.lib
+*.exp
+*.lnk
+*.sys
+*.cat
+*.dat
+*.msg
+
+# Local certificates/keys
+*.key
+*.crt
+
+# Logs
+*.log

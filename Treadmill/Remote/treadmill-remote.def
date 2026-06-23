@@ -1,0 +1,8 @@
+LIBRARY	"treadmill-remote"
+
+EXPORTS
+   TREADMILL_initialize @1
+   TREADMILL_setSpeed @2
+   TREADMILL_close @3
+   TREADMILL_initializeUDP @4
+   TREADMILL_setSpeed4 @5

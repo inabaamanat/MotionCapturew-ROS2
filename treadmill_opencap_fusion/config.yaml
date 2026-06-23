@@ -1,0 +1,112 @@
+# =====================================================================
+# Treadmill <-> OpenCap fusion configuration
+# Paths are resolved relative to this file's directory unless absolute.
+# =====================================================================
+
+trial_name: Stationary_Walking_2
+
+paths:
+  force_npz: ../iggdl_RENAME.npz
+  opencap_dir: ../OpenCapData_474a5c90-cb77-4b56-a9c5-6141cde30265
+  # The kinematics .mot, markers .trc, model .osim and videos are located
+  # automatically inside opencap_dir from trial_name. Override here if needed.
+  mot: null          # auto: OpenSimData/Kinematics/<trial>.mot
+  trc: null          # auto: MarkerData/<trial>.trc
+  osim: null         # auto: OpenSimData/Model/<trial>/*.osim
+  raw_video: null    # auto: Videos/Cam0/InputMedia/<trial>/<trial>.mov
+  sync_video: null   # auto: Videos/trimmed/InputMedia/<trial>/<trial>_sync.mp4
+  output_dir: output
+
+# --------------------------------------------------------------------
+# Force / treadmill acquisition
+# --------------------------------------------------------------------
+force:
+  # Row index in DATA[] that stores elapsed seconds since START (the sync clock).
+  time_row: 13
+  # Nominal acquisition rate (Hz). Used only for diagnostics; the real time
+  # vector comes from DATA[time_row].
+  nominal_rate_hz: 100
+  # Order of the 12 analog channels in DATA rows 0..11, taken from the
+  # acquisition script (functions_HILO.py): left plate then right plate.
+  channel_order: [L_Fx, L_Fy, L_Fz, L_Mx, L_My, L_Mz,
+                  R_Fx, R_Fy, R_Fz, R_Mx, R_My, R_Mz]
+  # Low-pass filter applied to force signals before analysis (Butterworth).
+  filter:
+    enabled: true
+    cutoff_hz: 20.0
+    order: 4
+
+# --------------------------------------------------------------------
+# Calibration: raw volts -> Newtons / Newton-metres
+# mode = matrix | gains | bodyweight
+# --------------------------------------------------------------------
+calibration:
+  mode: bodyweight
+
+  # mode: matrix  -- per-plate 6x6 matrix mapping [Fx Fy Fz Mx My Mz]_volts
+  #                  to [Fx Fy Fz Mx My Mz]_SI. Replace the nulls with the
+  #                  Bertec-provided matrices (row-major, 6 lists of 6).
+  matrix:
+    left: null
+    right: null
+
+  # mode: gains   -- simple per-channel scalars (SI_value = volts * gain).
+  #                  Order matches force.channel_order.
+  gains:
+    L_Fx: 1.0
+    L_Fy: 1.0
+    L_Fz: 1.0
+    L_Mx: 1.0
+    L_My: 1.0
+    L_Mz: 1.0
+    R_Fx: 1.0
+    R_Fy: 1.0
+    R_Fz: 1.0
+    R_Mx: 1.0
+    R_My: 1.0
+    R_Mz: 1.0
+
+  # mode: bodyweight -- vertical (Fz) scale derived from known body mass so that
+  #                     mean total stance Fz == body weight. Shear/moment channels
+  #                     reuse the Fz volts->N scale (approximate).
+  bodyweight:
+    # If null, body mass is read from the .osim segment masses.
+    body_mass_kg: null
+
+  # Vertical distance (m) from the force-sensor origin to the top of the belt
+  # surface, used in the COP correction (COPx = (-My + Fx*dz)/Fz, etc.).
+  surface_dz_m: 0.0
+  # Fz magnitude (N, after calibration) below which COP is undefined (no contact).
+  cop_fz_threshold_n: 20.0
+
+# --------------------------------------------------------------------
+# Gait event detection
+# --------------------------------------------------------------------
+gait:
+  # Vertical force threshold for stance, as a fraction of body weight.
+  stance_threshold_bw: 0.05
+  # Minimum time (s) between successive contacts of the same foot (debounce).
+  min_step_interval_s: 0.30
+
+# --------------------------------------------------------------------
+# Synchronization between force clock and OpenCap clock
+# --------------------------------------------------------------------
+sync:
+  # contact_xcorr : per-foot (-foot height) vs plate Fz cross-correlation,
+  #                 L+R combined (robust default). manual : use manual_offset_s.
+  method: contact_xcorr
+  resample_hz: 100         # internal rate for cross-correlation
+  max_lag_s: 30.0          # search window for the force->opencap offset
+  manual_offset_s: null    # used only when method: manual
+
+# --------------------------------------------------------------------
+# Overlay video rendering
+# --------------------------------------------------------------------
+overlay:
+  enabled: true
+  target: raw              # raw (1280x720) | sync (360x640)
+  fps: null                # null -> use source video fps
+  draw_skeleton: true      # draw a 2D skeleton (bones/joints/angles) on the body
+  pose_model: yolo11n-pose.pt   # YOLO pose model for on-body keypoint detection
+  scrolling_window_s: 4.0  # width of the live scrolling plots
+  codec: mp4v

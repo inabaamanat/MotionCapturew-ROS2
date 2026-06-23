@@ -1,0 +1,141 @@
+# =====================================================================
+# Live capture configuration (2 USB cameras + Bertec force -> live 3D mocap)
+# Paths resolved relative to this file unless absolute.
+# =====================================================================
+
+# Leave null for timestamped trial folders. Set to a short label only when you
+# intentionally want that label included in the output folder name.
+session_name: null
+
+mode: live          # replay | live
+
+# --------------------------------------------------------------------
+# Cameras
+# --------------------------------------------------------------------
+cameras:
+  # LIVE: USB cameras via OpenCV device indices.
+  live:
+    cam0: "2"
+    cam1: "4"
+    # OpenCV latency tuning (applied by CameraSource):
+    width: 1280
+    height: 720
+    fps: 30
+    buffersize: 1
+    ffmpeg_opts: ""
+  # Physical mounting plan for trial setup. Stereo calibration measures the
+  # actual camera geometry; these angles are documented setup targets.
+  mount_geometry:
+    walking_direction_deg: 0
+    cam0_angle_deg: 45
+    cam1_angle_deg: 315
+  # REPLAY: feed existing video files in real time for hardware-free testing.
+  replay:
+    cam0: ../OpenCapData_474a5c90-cb77-4b56-a9c5-6141cde30265/Videos/Cam0/InputMedia/Stationary_Walking_2/Stationary_Walking_2.mov
+    cam1: ../OpenCapData_474a5c90-cb77-4b56-a9c5-6141cde30265/Videos/Cam0/InputMedia/Stationary_Walking_2/Stationary_Walking_2.mov
+    loop: true
+  frame_pair_tolerance_s: 0.020   # max |t0-t1| to triangulate a frame pair
+  transport_latency_s: 0.0        # fixed offset added to camera timestamps (est. once)
+
+# --------------------------------------------------------------------
+# Force plates (Bertec via NI-DAQ); channel map reused from functions_HILO.py
+# --------------------------------------------------------------------
+force:
+  live:
+    device: Dev1
+    channels: [ai31, ai23, ai30, ai22, ai29, ai21,    # LEFT  Fx Fy Fz Mx My Mz
+               ai20, ai27, ai19, ai26, ai18, ai25]    # RIGHT Fx Fy Fz Mx My Mz
+    terminal_config: 10083        # nidaqmx differential code used in existing script
+    rate_hz: 1000                 # hardware sample rate
+    read_chunk: 10                # samples per read
+  replay:
+    npz: ../iggdl_RENAME.npz      # existing recording, streamed at real cadence
+    data_time_row: 13             # elapsed-seconds row in DATA
+    loop: true
+  channel_order: [L_Fx, L_Fy, L_Fz, L_Mx, L_My, L_Mz,
+                  R_Fx, R_Fy, R_Fz, R_Mx, R_My, R_Mz]
+  filter: {enabled: true, cutoff_hz: 20.0, order: 4}
+
+# --------------------------------------------------------------------
+# Calibration (force volts->N + camera intrinsics/extrinsics)
+# --------------------------------------------------------------------
+calibration:
+  # Force: reuse treadmill_opencap_fusion calibration schema.
+  force:
+    mode: bodyweight            # matrix | gains | bodyweight
+    body_mass_kg: 82.0
+    # Bodyweight mode is a temporary gait-only fallback until the Bertec matrix
+    # or per-channel gains are entered. Stand quietly for this many seconds
+    # after starting capture so the live stream can estimate N/V from body mass.
+    auto_bodyweight_seconds: 2.0
+    min_total_fz_volts: 0.05
+    auto_bodyweight_max_cv: 0.08
+    surface_dz_m: 0.0
+    cop_fz_threshold_n: 20.0
+  # Camera calibration files written by livecap/calib/run_calibration.py
+  cameras:
+    intrinsics_cam0: calib/cam0_intrinsics.npz
+    intrinsics_cam1: calib/cam1_intrinsics.npz
+    extrinsics: calib/stereo_extrinsics.npz   # holds P0, P1 projection matrices
+    # Checkerboard inner-corner count and square size. For the 100 mm grid,
+    # square_m must be 0.100. cols/rows are INNER corners, not printed squares.
+    checkerboard: {cols: 4, rows: 7, square_m: 0.100, min_pairs: 12}
+
+# --------------------------------------------------------------------
+# Pose / 3D
+# --------------------------------------------------------------------
+pose:
+  model: yolo11n-pose.pt
+  device: cuda          # cuda on the capture PC; cpu fallback elsewhere
+  conf_thresh: 0.3
+  target_fps: 30        # pose processing rate cap
+  imgsz: 640             # YOLO inference size; 640 is a strong latency/accuracy tradeoff
+  half: true             # FP16 on CUDA for lower latency
+  max_det: 1             # only track the primary subject
+  fuse: true             # fuse model layers at startup where supported
+  warmup: true           # run one startup inference to avoid first-frame stall
+  warmup_shape: [1280, 720]  # [height, width] matching the portrait camera frames
+  warmup_batch: 2        # stereo pair batch warmup
+  smoothing:
+    enabled: true        # live low-latency 3D keypoint smoothing for angle stability
+    alpha: 0.55          # higher = less smoothing, lower = steadier but more lag
+    max_gap_s: 0.20      # reset filter after dropped/unsynced frame gaps
+
+# --------------------------------------------------------------------
+# Gait
+# --------------------------------------------------------------------
+gait:
+  stance_threshold_bw: 0.05
+  min_step_interval_s: 0.30
+
+# --------------------------------------------------------------------
+# GUI
+# --------------------------------------------------------------------
+gui:
+  width: 1600
+  height: 950
+  plot_window_s: 6.0
+  refresh_hz: 60
+
+# --------------------------------------------------------------------
+# Recording (mirrors treadmill_opencap_fusion output schema)
+# --------------------------------------------------------------------
+recording:
+  output_dir: recordings
+  save_raw_video: true
+  buffer_minutes: 10
+  subject_id: null
+  name: null
+  notes: ""
+  walking_condition: null
+  surface_type: treadmill
+  shoe_type: null
+
+# --------------------------------------------------------------------
+# Pressure processing
+# --------------------------------------------------------------------
+pressure:
+  # Used when only force/COP data are available rather than a sensel pressure
+  # grid. Replace with sensor-specific contact area or a pressure processor
+  # when instrumented insoles / mat data are added.
+  estimated_contact_area_m2: 0.015
