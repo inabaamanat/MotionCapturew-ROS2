@@ -10,10 +10,18 @@ consumer never causes a growing backlog / latency creep.
 from __future__ import annotations
 
 import os
+os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
+os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "-8")
+
 import threading
 import time
 
 import cv2
+
+try:
+    cv2.setLogLevel(0)
+except Exception:
+    pass
 
 from .. import clock
 from ..buffers import LatestSlot

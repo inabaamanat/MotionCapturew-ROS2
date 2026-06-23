@@ -2,13 +2,42 @@
 from __future__ import annotations
 
 import os
+os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
+os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "-8")
+
 import shutil
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 import cv2
 import numpy as np
+
+try:
+    cv2.setLogLevel(0)
+except Exception:
+    pass
+
+
+@contextmanager
+def _suppress_native_stderr():
+    """Temporarily hide FFmpeg decoder chatter emitted below Python logging."""
+    try:
+        saved = os.dup(2)
+        devnull = os.open(os.devnull, os.O_WRONLY)
+    except OSError:
+        yield
+        return
+    try:
+        os.dup2(devnull, 2)
+        yield
+    finally:
+        try:
+            os.dup2(saved, 2)
+        finally:
+            os.close(saved)
+            os.close(devnull)
 
 from ..calib import load_stereo
 from ..pose.angles import compute_angles
@@ -35,19 +64,65 @@ def _profile_config(cfg) -> dict[str, Any]:
 def _video_frame_count(path: Path) -> int:
     if not path.exists():
         return 0
-    cap = cv2.VideoCapture(str(path))
+    with _suppress_native_stderr():
+        cap = cv2.VideoCapture(str(path))
+        try:
+            return int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        finally:
+            cap.release()
+
+
+def _write_npz_compressed(path: Path, **payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{time.time_ns()}.tmp")
     try:
-        return int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        with open(tmp, "wb") as fh:
+            np.savez_compressed(fh, **payload)
+        os.replace(tmp, path)
     finally:
-        cap.release()
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+
+
+def _atomic_copy(src: Path, dst: Path):
+    tmp = dst.with_name(f".{dst.name}.{time.time_ns()}.tmp")
+    try:
+        shutil.copy2(src, tmp)
+        os.replace(tmp, dst)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+
+
+def _npz_readable(path: Path) -> bool:
+    if not path.exists():
+        return False
+    try:
+        with np.load(path, allow_pickle=True) as z:
+            _ = z.files
+        return True
+    except Exception as exc:
+        print(f"[trials] ignoring unreadable precision pose file {path}: {exc}")
+        return False
 
 
 def _source_times(rec_dir: Path, n_frames: int, fps: float) -> tuple[np.ndarray, float]:
     pose_path = rec_dir / "pose.npz"
     if pose_path.exists():
-        with np.load(pose_path, allow_pickle=True) as z:
-            old_t = np.asarray(z.get("t", np.zeros(0)), float)
-            start_epoch = float(z.get("start_epoch", old_t[0] if old_t.size else time.time()))
+        try:
+            with np.load(pose_path, allow_pickle=True) as z:
+                old_t = np.asarray(z.get("t", np.zeros(0)), float)
+                start_epoch = float(z.get("start_epoch", old_t[0] if old_t.size else time.time()))
+        except Exception as exc:
+            print(f"[trials] could not read source pose timestamps from {pose_path}: {exc}")
+            old_t = np.zeros(0)
+            start_epoch = time.time()
         if old_t.size:
             if n_frames <= old_t.size:
                 return old_t[:n_frames], start_epoch
@@ -60,13 +135,15 @@ def _source_times(rec_dir: Path, n_frames: int, fps: float) -> tuple[np.ndarray,
 
 
 def _open_video(path: Path):
-    cap = cv2.VideoCapture(str(path))
+    with _suppress_native_stderr():
+        cap = cv2.VideoCapture(str(path))
     return cap if cap.isOpened() else None
 
 
 def _read_pair(cap0, cap1):
-    ok0, f0 = cap0.read() if cap0 is not None else (False, None)
-    ok1, f1 = cap1.read() if cap1 is not None else (False, None)
+    with _suppress_native_stderr():
+        ok0, f0 = cap0.read() if cap0 is not None else (False, None)
+        ok1, f1 = cap1.read() if cap1 is not None else (False, None)
     return (f0 if ok0 else None), (f1 if ok1 else None)
 
 
@@ -100,12 +177,12 @@ def reprocess_trial_pose(recording_dir: str | os.PathLike, cfg,
         return None
     out_path = rec_dir / "pose.npz"
     marker = rec_dir / "pose_precision.npz"
-    if marker.exists() and not force:
+    if _npz_readable(marker) and not force:
         emit("precision_pose", 1, 1, "Using existing precision pose file")
-        shutil.copy2(marker, out_path)
+        _atomic_copy(marker, out_path)
         return out_path
     if out_path.exists() and not (rec_dir / "pose_live.npz").exists():
-        shutil.copy2(out_path, rec_dir / "pose_live.npz")
+        _atomic_copy(out_path, rec_dir / "pose_live.npz")
 
     cap0 = _open_video(cam0_path)
     cap1 = _open_video(cam1_path)
@@ -232,7 +309,7 @@ def reprocess_trial_pose(recording_dir: str | os.PathLike, cfg,
         "offline_pose_model": np.array(str(pose_cfg.get("model", ""))),
         "offline_pose_imgsz": np.array(int(pose_cfg.get("imgsz", 960) or 960)),
     }
-    np.savez_compressed(marker, **payload)
-    shutil.copy2(marker, out_path)
+    _write_npz_compressed(marker, **payload)
+    _atomic_copy(marker, out_path)
     emit("precision_pose", n_frames, n_frames, "Precision pose file written")
     return out_path

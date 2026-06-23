@@ -156,6 +156,13 @@ offline_processing:
 gait:
   stance_threshold_bw: 0.05
   min_step_interval_s: 0.30
+  # Offline event extraction from saved GRF uses hysteresis so noise around
+  # light-contact thresholds does not create same-foot duplicate steps.
+  use_recorded_events: false
+  event_on_threshold_bw: 0.20
+  event_off_threshold_bw: 0.10
+  min_stride_interval_s: 0.60
+  min_stance_time_s: 0.10
 
 # --------------------------------------------------------------------
 # GUI
@@ -166,6 +173,15 @@ gui:
   plot_window_s: 6.0
   refresh_hz: 60
   main_overlay_camera: 0      # largest skeleton overlay: cam0 main view
+
+# --------------------------------------------------------------------
+# Phone remote control (served from the GUI process on the local hotspot/LAN)
+# --------------------------------------------------------------------
+remote_control:
+  enabled: true
+  host: 0.0.0.0
+  port: 8765
+  pin: "7370"
 
 # --------------------------------------------------------------------
 # Recording (mirrors treadmill_opencap_fusion output schema)

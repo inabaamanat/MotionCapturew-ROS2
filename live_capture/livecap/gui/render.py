@@ -8,8 +8,17 @@ standalone (save to PNG) for headless testing.
 """
 from __future__ import annotations
 
+import os
+os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
+os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "-8")
+
 import cv2
 import numpy as np
+
+try:
+    cv2.setLogLevel(0)
+except Exception:
+    pass
 
 from ..pose.detector import IDX, SKELETON
 from ..state import ANGLE_NAMES
@@ -101,10 +110,17 @@ def _project_fused_kp_to_camera(kp3d, valid, stereo, cam_id):
         rvec, _ = cv2.Rodrigues(np.asarray(stereo.R, dtype=float))
         tvec = np.asarray(stereo.T, dtype=float).reshape(3, 1)
         K, dist = stereo.K1, stereo.dist1
+        cam_pts = (np.asarray(stereo.R, dtype=float) @ pts.T).T + tvec.reshape(1, 3)
     else:
         rvec = np.zeros((3, 1), dtype=float)
         tvec = np.zeros((3, 1), dtype=float)
         K, dist = stereo.K0, stereo.dist0
+        cam_pts = pts
+    # Points behind or nearly on the camera plane can project to enormous
+    # finite pixel values. Treat them as invalid for drawing.
+    good &= np.isfinite(cam_pts[:, 2]) & (cam_pts[:, 2] > 0.10)
+    if not np.any(good):
+        return None
     proj, _ = cv2.projectPoints(pts[good], rvec, tvec, K, dist)
     out[good, :2] = proj.reshape(-1, 2)
     out[good, 2] = 1.0
@@ -121,6 +137,20 @@ def _interp(a, b, t):
 
 def _as_pt(p):
     return int(round(p[0])), int(round(p[1]))
+
+
+def _drawable_pt(frame, p, margin=None):
+    arr = np.asarray(p, dtype=float).reshape(-1)
+    if arr.size < 2 or not np.all(np.isfinite(arr[:2])):
+        return None
+    h, w = frame.shape[:2]
+    m = float(margin if margin is not None else max(2000, 2 * max(w, h)))
+    x, y = float(arr[0]), float(arr[1])
+    if x < -m or x > w + m or y < -m or y > h + m:
+        return None
+    if abs(x) > 2_000_000_000 or abs(y) > 2_000_000_000:
+        return None
+    return int(round(x)), int(round(y))
 
 
 def _bone_line(img, a, b, thickness=7, color=BONE):
@@ -325,7 +355,10 @@ def _quality_color(tag, q):
 
 
 def _draw_crosshair(img, pt, color, r=6):
-    x, y = int(round(pt[0])), int(round(pt[1]))
+    c = _drawable_pt(img, pt)
+    if c is None:
+        return
+    x, y = c
     cv2.circle(img, (x, y), r, (10, 10, 12), -1, cv2.LINE_AA)
     cv2.circle(img, (x, y), r, color, 2, cv2.LINE_AA)
     cv2.line(img, (x - r - 3, y), (x + r + 3, y), color, 1, cv2.LINE_AA)
@@ -338,11 +371,12 @@ def draw_precision_pose_overlay(frame, kp, angles, source_label="measured keypoi
         return frame
     for an, bn, tag in SKELETON:
         a, b = kp[IDX[an]], kp[IDX[bn]]
-        if np.all(np.isfinite(a[:2])) and np.all(np.isfinite(b[:2])):
+        pa, pb = _drawable_pt(frame, a[:2]), _drawable_pt(frame, b[:2])
+        if pa is not None and pb is not None:
             q = min(_joint_quality(a), _joint_quality(b))
             c = _quality_color(tag, q)
-            cv2.line(frame, _as_pt(a[:2]), _as_pt(b[:2]), (8, 8, 10), 5, cv2.LINE_AA)
-            cv2.line(frame, _as_pt(a[:2]), _as_pt(b[:2]), c, 2, cv2.LINE_AA)
+            cv2.line(frame, pa, pb, (8, 8, 10), 5, cv2.LINE_AA)
+            cv2.line(frame, pa, pb, c, 2, cv2.LINE_AA)
 
     label_joints = {
         "Lshoulder", "Rshoulder", "Lhip", "Rhip",
@@ -350,7 +384,7 @@ def draw_precision_pose_overlay(frame, kp, angles, source_label="measured keypoi
     }
     for name in label_joints:
         p = kp[IDX[name]]
-        if np.all(np.isfinite(p[:2])):
+        if _drawable_pt(frame, p[:2]) is not None:
             tag = "L" if name.startswith("L") else ("R" if name.startswith("R") else "C")
             _draw_crosshair(frame, p[:2], _quality_color(tag, _joint_quality(p)),
                             6 if name.endswith(("hip", "knee", "ankle")) else 4)
@@ -365,10 +399,11 @@ def draw_precision_pose_overlay(frame, kp, angles, source_label="measured keypoi
         for jn, key, short in labels:
             p = kp[IDX[jn]]
             v = _safe(angles.get(key))
-            if np.all(np.isfinite(p[:2])) and np.isfinite(v):
+            pxy = _drawable_pt(frame, p[:2], margin=250)
+            if pxy is not None and np.isfinite(v):
                 side = "L" if jn.startswith("L") else "R"
                 dx = 10 if side == "R" else -88
-                org = (int(p[0]) + dx, int(p[1]) - 10)
+                org = (pxy[0] + dx, pxy[1] - 10)
                 _text(frame, f"{side} {short} {v:.1f}deg", (org[0] + 1, org[1] + 1),
                       0.46, (5, 5, 6), 3)
                 _text(frame, f"{side} {short} {v:.1f}deg", org, 0.46,

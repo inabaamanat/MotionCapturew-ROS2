@@ -66,6 +66,8 @@ class TreadmillController:
         self.fixed_acc = 0.0
         self.incline_deg = 0.0
         self.current_speed = 0.0
+        self.left_speed = 0.0
+        self.right_speed = 0.0
         self.self_paced = False
         self.connected = False
         self.last_error = ""
@@ -89,7 +91,10 @@ class TreadmillController:
                                          self.incline_deg * 100)
             self.connected = True
             self.last_error = ""
-            self.current_speed = (r or 0) / 1000.0
+            self.right_speed = (r or 0) / 1000.0
+            self.left_speed = (l or 0) / 1000.0
+            vals = [v for v in (self.right_speed, self.left_speed) if np.isfinite(v)]
+            self.current_speed = float(np.mean(vals)) if vals else 0.0
             return self.current_speed
         except Exception as e:
             self.connected = False
@@ -103,6 +108,8 @@ class TreadmillController:
                 treadmill_mode=mode,
                 treadmill_target_vel=(self.sp_speed if self.self_paced else self.fixed_vel),
                 treadmill_current_vel=self.current_speed,
+                treadmill_left_vel=self.left_speed,
+                treadmill_right_vel=self.right_speed,
                 treadmill_incline=self.incline_deg,
                 treadmill_connected=self.connected)
 

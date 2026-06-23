@@ -14,6 +14,9 @@ import os
 import sys
 import time
 
+os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
+os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "-8")
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from livecap.engine import Engine

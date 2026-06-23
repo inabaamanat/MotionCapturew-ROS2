@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import stat
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -21,8 +24,48 @@ def _read_json(path: Path, default):
 def _npz_dict(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
-    with np.load(path, allow_pickle=True) as z:
-        return {k: z[k] for k in z.files}
+    try:
+        with np.load(path, allow_pickle=True) as z:
+            return {k: z[k] for k in z.files}
+    except Exception as exc:
+        print(f"[trials] ignoring unreadable npz artifact {path}: {exc}")
+        return {}
+
+
+def _clear_delete_attrs(path: Path):
+    """Make a OneDrive/Windows path writable enough for deletion."""
+    try:
+        os.chmod(path, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
+    except Exception:
+        pass
+    if os.name == "nt":
+        try:
+            import ctypes
+            attrs = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+            if attrs != -1:
+                # FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM
+                attrs &= ~(0x01 | 0x02 | 0x04)
+                ctypes.windll.kernel32.SetFileAttributesW(str(path), attrs)
+        except Exception:
+            pass
+
+
+def _rmtree_windows_tolerant(path: Path):
+    def onerror(func, failing_path, exc_info):
+        _clear_delete_attrs(Path(failing_path))
+        func(failing_path)
+
+    for child in sorted(path.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+        _clear_delete_attrs(child)
+    _clear_delete_attrs(path)
+    try:
+        shutil.rmtree(path, onerror=onerror)
+    except PermissionError:
+        time.sleep(0.4)
+        for child in sorted(path.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+            _clear_delete_attrs(child)
+        _clear_delete_attrs(path)
+        shutil.rmtree(path, onerror=onerror)
 
 
 @dataclass
@@ -124,6 +167,17 @@ class RecordingDataManager:
         direct = self.recordings_dir / trial_id_or_name
         return Trial(direct) if (direct / "metadata.json").exists() else None
 
+    def delete_trial(self, trial_id_or_name: str) -> Path:
+        trial = self.get_trial(trial_id_or_name)
+        if trial is None:
+            raise FileNotFoundError(f"trial not found: {trial_id_or_name}")
+        root = self.recordings_dir.resolve()
+        target = trial.path.resolve()
+        if target == root or root not in target.parents:
+            raise ValueError(f"refusing to delete outside recordings root: {target}")
+        _rmtree_windows_tolerant(target)
+        return target
+
     def search(self, text: str = "", **filters) -> list[dict[str, Any]]:
         text = (text or "").lower()
         out = []
@@ -158,7 +212,7 @@ class RecordingDataManager:
             return None
         emit("start", 0, 1, f"Preparing {trial.path.name}")
         from .offline_pose import reprocess_trial_pose
-        reprocess_trial_pose(trial.path, cfg, force=True, progress=progress)
+        reprocess_trial_pose(trial.path, cfg, force=False, progress=progress)
         from .analysis import build_trial_artifacts
         emit("artifacts", 0, 1, "Building normalized trial files")
         metadata = build_trial_artifacts(trial.path, cfg)

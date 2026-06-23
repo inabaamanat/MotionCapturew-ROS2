@@ -78,6 +78,21 @@ def _write_json(path: Path, payload: dict | list):
     path.write_text(json.dumps(_json_ready(payload), indent=2), encoding="utf-8")
 
 
+def _write_npz_compressed(path: Path, **payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with open(tmp, "wb") as fh:
+            np.savez_compressed(fh, **payload)
+        os.replace(tmp, path)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+
+
 def _nearest_indices(source_t: np.ndarray, target_t: np.ndarray) -> np.ndarray:
     if source_t.size == 0 or target_t.size == 0:
         return np.zeros(target_t.size, dtype=int)
@@ -106,8 +121,12 @@ def _gradient(x: np.ndarray, t: np.ndarray) -> np.ndarray:
 def _load_npz(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
-    with np.load(path, allow_pickle=True) as z:
-        return {k: z[k] for k in z.files}
+    try:
+        with np.load(path, allow_pickle=True) as z:
+            return {k: z[k] for k in z.files}
+    except Exception as exc:
+        print(f"[trials] ignoring unreadable npz artifact {path}: {exc}")
+        return {}
 
 
 def _camera_confidence(kp0: np.ndarray, kp1: np.ndarray | None = None) -> np.ndarray:
@@ -188,7 +207,10 @@ def _angle_table(pose: dict[str, Any], frame_t: np.ndarray) -> dict[str, Any]:
 
 
 def _derive_force_events(force: dict[str, Any], body_mass_kg: float,
-                         threshold_bw: float) -> list[dict[str, Any]]:
+                         threshold_bw: float, on_threshold_bw: float | None = None,
+                         off_threshold_bw: float | None = None,
+                         min_stride_interval_s: float = 0.60,
+                         min_stance_time_s: float = 0.10) -> list[dict[str, Any]]:
     data = np.asarray(force.get("DATA", np.zeros((14, 0))), float)
     cal = np.asarray(force.get("CAL", np.zeros((0, len(FORCE_KEYS)))), float)
     if data.shape[1] == 0:
@@ -197,26 +219,42 @@ def _derive_force_events(force: dict[str, Any], body_mass_kg: float,
     if cal.shape[0] != t.size:
         return []
     fz_l, fz_r = cal[:, FORCE_KEYS.index("L_Fz")], cal[:, FORCE_KEYS.index("R_Fz")]
-    thr = threshold_bw * body_mass_kg * GRAVITY
+    on_bw = max(float(threshold_bw), float(on_threshold_bw if on_threshold_bw is not None else 0.20))
+    off_bw = float(off_threshold_bw if off_threshold_bw is not None else max(threshold_bw, on_bw * 0.50))
+    on_thr = on_bw * body_mass_kg * GRAVITY
+    off_thr = off_bw * body_mass_kg * GRAVITY
     events = []
     for side, fz in (("L", fz_l), ("R", fz_r)):
-        stance = np.asarray(fz > thr, bool)
-        if stance.size < 2:
-            continue
-        changes = np.where(np.diff(stance.astype(int)) != 0)[0] + 1
+        in_stance = bool(fz[0] > off_thr) if fz.size else False
+        # If the recording starts mid-stance, do not synthesize a heel strike
+        # at t=0. Wait for the next true rising edge.
+        hs_t = np.nan
         last_hs = -1e9
-        for i in changes:
-            if stance[i]:
-                if float(t[i]) - last_hs >= 0.20:
-                    events.append({"type": "HS", "side": side, "timestamp": float(t[i])})
-                    last_hs = float(t[i])
-            else:
-                events.append({"type": "TO", "side": side, "timestamp": float(t[i])})
+        for i in range(1, fz.size):
+            ts = float(t[i])
+            if not in_stance and fz[i] >= on_thr and ts - last_hs >= min_stride_interval_s:
+                in_stance = True
+                hs_t = ts
+                last_hs = ts
+            elif in_stance and fz[i] <= off_thr:
+                if np.isfinite(hs_t) and ts - hs_t >= min_stance_time_s:
+                    events.append({"type": "HS", "side": side, "timestamp": hs_t})
+                    events.append({"type": "TO", "side": side, "timestamp": ts})
+                in_stance = False
+                hs_t = np.nan
     return sorted(events, key=lambda e: e["timestamp"])
 
 
 def _load_recorded_events(force: dict[str, Any], body_mass_kg: float,
-                          threshold_bw: float) -> list[dict[str, Any]]:
+                          threshold_bw: float, cfg=None) -> list[dict[str, Any]]:
+    if cfg is not None and not bool(cfg.get("gait", "use_recorded_events", default=False)):
+        return _derive_force_events(
+            force, body_mass_kg, threshold_bw,
+            on_threshold_bw=cfg.get("gait", "event_on_threshold_bw", default=None),
+            off_threshold_bw=cfg.get("gait", "event_off_threshold_bw", default=None),
+            min_stride_interval_s=float(cfg.get("gait", "min_stride_interval_s", default=0.60) or 0.60),
+            min_stance_time_s=float(cfg.get("gait", "min_stance_time_s", default=0.10) or 0.10),
+        )
     if {"EVENT_TYPE", "EVENT_SIDE", "EVENT_T"} <= set(force):
         out = []
         types = force["EVENT_TYPE"].astype(str)
@@ -249,12 +287,13 @@ def _pressure_metrics(force: dict[str, Any], events: list[dict[str, Any]],
     cal = np.asarray(force.get("CAL", np.zeros((0, len(FORCE_KEYS)))), float)
     if data.shape[1] == 0 or cal.shape[0] == 0:
         empty = {"time_s": [], "left": {}, "right": {}}
-        np.savez_compressed(recording_dir / "pressure_timeseries.npz", time_s=np.zeros(0))
+        _write_npz_compressed(recording_dir / "pressure_timeseries.npz",
+                              time_s=np.zeros(0))
         return empty, []
     t = np.asarray(data[13], float)
     left = {k[2:]: cal[:, FORCE_KEYS.index(k)] for k in FORCE_KEYS if k.startswith("L_")}
     right = {k[2:]: cal[:, FORCE_KEYS.index(k)] for k in FORCE_KEYS if k.startswith("R_")}
-    np.savez_compressed(
+    _write_npz_compressed(
         recording_dir / "pressure_timeseries.npz",
         time_s=t,
         L_Fz=left["Fz"], R_Fz=right["Fz"],
@@ -309,7 +348,7 @@ def _build_step_events(force: dict[str, Any], frame_data: dict[str, np.ndarray],
                        pressure_by_hs: list[dict[str, Any]], cfg) -> tuple[list[dict], list[dict]]:
     body_mass = float(cfg.get("calibration", "force", "body_mass_kg", default=75.0) or 75.0)
     threshold_bw = float(cfg.get("gait", "stance_threshold_bw", default=0.05) or 0.05)
-    events = _load_recorded_events(force, body_mass, threshold_bw)
+    events = _load_recorded_events(force, body_mass, threshold_bw, cfg)
     frame_t = frame_data["timestamp"]
     steps = []
     hs = [e for e in events if e["type"] == "HS"]
@@ -490,8 +529,8 @@ def build_trial_artifacts(recording_dir: str | os.PathLike, cfg) -> dict[str, An
         "quality_processing_latency_ms": np.full(frame_t.size, np.nan),
         "quality_reprojection_error_px": reproj,
     }
-    np.savez_compressed(rec_dir / "frame_data.npz",
-                        joint_names=np.array(COCO_NAMES), **frame_data)
+    _write_npz_compressed(rec_dir / "frame_data.npz",
+                          joint_names=np.array(COCO_NAMES), **frame_data)
 
     pressure_series, pressure_by_hs = _pressure_metrics(force, [], cfg, rec_dir)
     steps, events = _build_step_events(force, frame_data, pressure_by_hs, cfg)

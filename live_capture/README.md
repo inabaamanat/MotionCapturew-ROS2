@@ -87,6 +87,21 @@ uses the low-latency pose profile; processing reruns the saved `cam0.mp4` and
 `cam1.mp4` with the offline precision profile before building gait metrics,
 exports, and playback.
 
+### Phone remote control
+
+When the DearPyGui app is running, it also starts a small local web remote if
+`remote_control.enabled` is true in `config.yaml`. Open the URL printed in the
+GUI/terminal from a phone on the same hotspot or LAN, for example:
+
+```text
+http://<capture-pc-ip>:8765
+```
+
+The default PIN is configured in `remote_control.pin`. The phone remote can
+start/stop capture, arm recording, stop+save, process the latest trial, toggle
+self-paced mode, and stop the treadmill. If Windows Firewall prompts for Python,
+allow access on the private network.
+
 ### Treadmill control (full, faithful to the existing GUI)
 
 The Bertec treadmill is controlled from this GUI with identical behaviour to

@@ -60,6 +60,7 @@ class SharedState:
             # treadmill
             "treadmill_mode": "FIXED", "treadmill_target_vel": 0.0,
             "treadmill_current_vel": 0.0, "treadmill_incline": 0.0,
+            "treadmill_left_vel": 0.0, "treadmill_right_vel": 0.0,
             "treadmill_connected": False,
         }
         self._stereo_calib = None

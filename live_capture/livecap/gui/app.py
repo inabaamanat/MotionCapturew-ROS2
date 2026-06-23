@@ -9,6 +9,7 @@ OpenCV-window backend is provided as a fallback (run_live.py --backend cv2).
 from __future__ import annotations
 
 import os
+import queue
 import subprocess
 import sys
 import threading
@@ -21,7 +22,8 @@ from .render import build_dashboard, dashboard_hit_test, dashboard_resize_hit_te
 from ..sources.camera import CameraSource
 from ..trials.export import TrialExporter
 from ..trials.manager import RecordingDataManager
-from ..trials.render import build_trial_review
+from ..trials.render import build_trial_review, release_video_cache_for_trial
+from .remote import RemoteControlServer, local_urls
 
 
 class DearPyGuiApp:
@@ -82,6 +84,15 @@ class DearPyGuiApp:
             "result_path": None,
         }
         self._processing_notice_consumed = True
+        self._pending_delete_trial_key = None
+        remote_cfg = cfg.get("remote_control", default={}) or {}
+        self.remote_enabled = bool(remote_cfg.get("enabled", True))
+        self.remote_host = str(remote_cfg.get("host", "0.0.0.0") or "0.0.0.0")
+        self.remote_port = int(remote_cfg.get("port", 8765) or 8765)
+        self.remote_pin = str(remote_cfg.get("pin", "7370") or "")
+        self.remote_server = None
+        self.remote_urls = local_urls(self.remote_port)
+        self._remote_commands = queue.Queue()
 
     def _frame_to_rgba(self, bgr):
         h, w = bgr.shape[:2]
@@ -155,6 +166,7 @@ class DearPyGuiApp:
                 dpg.add_combo(["cam0", "cam1"], tag="overlay_camera_combo",
                               default_value=f"cam{self.main_overlay_camera}",
                               width=90, callback=self._set_overlay_camera)
+                dpg.add_text("", tag="remote_status_text")
             # --- treadmill controls (mirror the existing GUI) ---
             with dpg.group(horizontal=True):
                 dpg.add_text("Treadmill")
@@ -193,7 +205,9 @@ class DearPyGuiApp:
         dpg.set_primary_window("main", True)
 
         self._start()
+        self._start_remote_control(dpg)
         while dpg.is_dearpygui_running():
+            self._process_remote_commands(dpg)
             dash_w, dash_h = self._dashboard_size(dpg)
             self._ensure_dashboard_texture(dpg, dash_w, dash_h)
             self._handle_dashboard_resize_drag(dpg, dash_w, dash_h)
@@ -219,6 +233,7 @@ class DearPyGuiApp:
             dpg.render_dearpygui_frame()
 
         self._stop()
+        self._stop_remote_control()
         if self._processing_thread and self._processing_thread.is_alive():
             self._processing_thread.join()
         self._process_pending_trials(show_status=False)
@@ -256,6 +271,150 @@ class DearPyGuiApp:
                 dpg.delete_item(old_tag)
             except Exception:
                 pass
+
+    def _start_remote_control(self, dpg=None):
+        if not self.remote_enabled:
+            return
+        if not self.remote_pin:
+            print("[remote] disabled: remote_control.pin is empty")
+            return
+        try:
+            self.remote_server = RemoteControlServer(
+                self, self.remote_host, self.remote_port, self.remote_pin)
+            self.remote_server.start()
+            self.remote_urls = local_urls(self.remote_port)
+            msg = f"Phone remote: {self.remote_urls[-1]}  PIN {self.remote_pin}"
+            print(f"[remote] {msg}")
+            if dpg is not None and dpg.does_item_exist("remote_status_text"):
+                dpg.set_value("remote_status_text", msg)
+        except Exception as exc:
+            msg = f"Phone remote unavailable: {exc}"
+            print(f"[remote] {msg}")
+            if dpg is not None and dpg.does_item_exist("remote_status_text"):
+                dpg.set_value("remote_status_text", msg)
+
+    def _stop_remote_control(self):
+        if self.remote_server is not None:
+            self.remote_server.stop()
+            self.remote_server = None
+
+    def enqueue_remote_command(self, command, payload=None):
+        done = threading.Event()
+        box = {}
+        self._remote_commands.put((command, payload or {}, done, box))
+        if not done.wait(timeout=10.0):
+            return {"ok": False, "error": "Command timed out waiting for GUI loop"}
+        return box.get("result", {"ok": False, "error": "No command result"})
+
+    def _process_remote_commands(self, dpg):
+        while True:
+            try:
+                command, payload, done, box = self._remote_commands.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                box["result"] = self._execute_remote_command(dpg, command, payload)
+            except Exception as exc:
+                box["result"] = {"ok": False, "error": str(exc)}
+            finally:
+                done.set()
+
+    def _execute_remote_command(self, dpg, command, payload):
+        command = str(command or "").strip().lower()
+        if command == "start_capture":
+            self._start()
+            return {"ok": True, "message": "Capture started", "status": self.remote_status()}
+        if command == "stop_capture":
+            self._stop()
+            return {"ok": True, "message": "Capture stopped", "status": self.remote_status()}
+        if command == "arm_recording":
+            if not self.recorder.armed:
+                out = self.recorder.arm()
+                self._refresh_trials()
+                return {"ok": True, "message": "Recording armed", "recording_dir": str(out)}
+            return {"ok": True, "message": "Recording already armed"}
+        if command == "stop_save":
+            if self.recorder.armed:
+                self._save()
+                return {"ok": True, "message": "Recording saved; processing queued"}
+            return {"ok": False, "error": "No active recording to save"}
+        if command == "process_selected":
+            if not self.selected_trial:
+                return {"ok": False, "error": "No selected trial"}
+            self._process_trial(self.selected_trial)
+            return {"ok": True, "message": "Processing selected trial"}
+        if command == "process_latest":
+            self._refresh_trials()
+            if not self.trials:
+                return {"ok": False, "error": "No trials found"}
+            trial = self.trial_manager.get_trial(self.trials[0].get("trial_id")
+                                                or self.trials[0].get("path"))
+            if not trial:
+                return {"ok": False, "error": "Latest trial could not be loaded"}
+            self.selected_trial = trial
+            self._process_trial(trial)
+            return {"ok": True, "message": f"Processing {trial.path.name}"}
+        if command == "toggle_self_paced":
+            self._toggle_self_paced()
+            return {"ok": True, "message": "Self-paced toggled", "status": self.remote_status()}
+        if command == "treadmill_stop":
+            self._tm_stop()
+            return {"ok": True, "message": "Treadmill stopped", "status": self.remote_status()}
+        if command == "set_fixed":
+            if "velocity" in payload and dpg.does_item_exist("inpt_vel"):
+                dpg.set_value("inpt_vel", float(payload.get("velocity") or 0.0))
+            if "acceleration" in payload and dpg.does_item_exist("inpt_acc"):
+                dpg.set_value("inpt_acc", float(payload.get("acceleration") or 0.5))
+            if "incline" in payload and dpg.does_item_exist("inpt_incl"):
+                dpg.set_value("inpt_incl", float(payload.get("incline") or 0.0))
+            self._set_fixed()
+            return {"ok": True, "message": "Fixed treadmill mode set", "status": self.remote_status()}
+        return {"ok": False, "error": f"Unknown command: {command}"}
+
+    def remote_status(self):
+        st = self.engine.state.get_status()
+        proc = self._get_processing_state()
+        latest = None
+        try:
+            trials = self.trial_manager.list_trials()
+            latest = trials[0] if trials else None
+        except Exception:
+            latest = None
+        selected = None
+        if self.selected_trial:
+            selected = {
+                "name": self.selected_trial.metadata.get("recording_name",
+                                                          self.selected_trial.path.name),
+                "path": self.selected_trial.path.name,
+                "processed": self.selected_trial.is_processed(),
+            }
+        return {
+            "ok": True,
+            "recording": bool(self.recorder.armed),
+            "capture_running": bool(getattr(self.engine, "_running", False)),
+            "session_t": round(float(st.get("session_t", 0.0) or 0.0), 2),
+            "pose_fps": round(float(st.get("pose_fps", 0.0) or 0.0), 1),
+            "cam0_fps": round(float(st.get("cam0_fps", 0.0) or 0.0), 1),
+            "cam1_fps": round(float(st.get("cam1_fps", 0.0) or 0.0), 1),
+            "calibrated_3d": bool(st.get("calibrated_3d")),
+            "treadmill_mode": st.get("treadmill_mode"),
+            "self_paced": str(st.get("treadmill_mode") or "").upper() == "SELF-PACED",
+            "treadmill_target_m_s": round(float(st.get("treadmill_target_vel", 0.0) or 0.0), 2),
+            "treadmill_speed_m_s": round(float(st.get("treadmill_current_vel", 0.0) or 0.0), 2),
+            "treadmill_left_m_s": round(float(st.get("treadmill_left_vel", st.get("treadmill_current_vel", 0.0)) or 0.0), 2),
+            "treadmill_right_m_s": round(float(st.get("treadmill_right_vel", st.get("treadmill_current_vel", 0.0)) or 0.0), 2),
+            "treadmill_incline_deg": round(float(st.get("treadmill_incline", 0.0) or 0.0), 1),
+            "treadmill_connected": bool(st.get("treadmill_connected")),
+            "processing": {
+                "running": bool(proc.get("running")),
+                "progress": round(float(proc.get("progress", 0.0) or 0.0), 3),
+                "message": proc.get("message"),
+                "error": proc.get("error"),
+            },
+            "latest_trial": latest,
+            "selected_trial": selected,
+            "remote_urls": self.remote_urls,
+        }
 
     def _handle_dashboard_double_click(self, dpg, w, h):
         if not dpg.does_item_exist("dash_image"):
@@ -530,10 +689,14 @@ class DearPyGuiApp:
                     dpg.add_button(label="Refresh", callback=lambda *_: self._refresh_trials())
                     dpg.add_button(label="Load Latest", callback=self._load_latest_trial)
                 dpg.add_spacer(height=6)
-                dpg.add_child_window(tag="trial_table_host", height=360, border=False)
+                dpg.add_child_window(tag="trial_table_host", height=300, border=False)
+                dpg.add_separator()
+                dpg.add_text("Process trials")
+                dpg.add_child_window(tag="trial_process_buttons_host", height=120,
+                                     border=False)
                 dpg.add_separator()
                 dpg.add_text("Steps")
-                dpg.add_child_window(tag="step_table_host", height=300, border=False)
+                dpg.add_child_window(tag="step_table_host", height=240, border=False)
             with dpg.child_window(width=-1, height=self.H - 120, tag="trial_detail"):
                 with dpg.group(horizontal=True):
                     dpg.add_button(label="Play", tag="trial_play_btn", callback=self._toggle_trial_play)
@@ -555,6 +718,7 @@ class DearPyGuiApp:
                     dpg.add_button(label="Next Chart", callback=lambda *_: self._cycle_trial_chart(1))
                     dpg.add_button(label="Process", tag="trial_process_btn",
                                    callback=self._process_selected_trial)
+                    dpg.add_button(label="Delete", callback=self._request_delete_selected_trial)
                     dpg.add_button(label="Open Overlay", callback=self._open_selected_overlay)
                     dpg.add_combo(["both", "raw", "processed"], tag="export_scope",
                                   default_value="both", width=120)
@@ -569,6 +733,14 @@ class DearPyGuiApp:
                     dpg.add_text("Idle", tag="trial_processing_text")
                 dpg.add_image(trial_tex, tag="trial_image",
                               width=self.W, height=self.H)
+        with dpg.window(label="Delete Recording?", tag="delete_trial_modal",
+                        modal=True, show=False, width=430, height=150):
+            dpg.add_text("", tag="delete_trial_text", wrap=390)
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="Delete Recording", width=150,
+                               callback=self._confirm_delete_trial)
+                dpg.add_button(label="Cancel", width=90,
+                               callback=self._cancel_delete_trial)
         self._refresh_trials()
 
     def _refresh_trials(self):
@@ -578,11 +750,14 @@ class DearPyGuiApp:
         if not dpg.does_item_exist("trial_table_host"):
             return
         dpg.delete_item("trial_table_host", children_only=True)
+        if dpg.does_item_exist("trial_process_buttons_host"):
+            dpg.delete_item("trial_process_buttons_host", children_only=True)
         with dpg.table(parent="trial_table_host", header_row=True, resizable=True,
                        borders_innerH=True, borders_innerV=False, borders_outerH=True):
             for name in ("Trial name", "Status", "Date", "Duration", "Steps", "Distance", "Speed", "Cadence"):
                 dpg.add_table_column(label=name)
             for row_idx, item in enumerate(self.trials):
+                key = self._trial_item_key(item)
                 with dpg.table_row():
                     label = item.get("recording_name") or item.get("path")
                     tag = f"trial_select_{row_idx}"
@@ -592,7 +767,8 @@ class DearPyGuiApp:
                         dpg.add_button(label="Select",
                                        callback=lambda s, a, u=item: self._select_trial(u))
                         dpg.add_button(label="Process",
-                                       callback=lambda s, a, u=item: self._process_trial_item(u))
+                                       callback=self._process_trial_from_user_data,
+                                       user_data=key)
                     dpg.add_text(str(item.get("status") or "raw_saved"))
                     dpg.add_text(str(item.get("date_time") or "")[:19])
                     dpg.add_text(self._fmt_ui(item.get("duration_s"), "s"))
@@ -600,6 +776,21 @@ class DearPyGuiApp:
                     dpg.add_text(self._fmt_ui(item.get("distance_m"), "m"))
                     dpg.add_text(self._fmt_ui(item.get("average_speed_m_s"), "m/s"))
                     dpg.add_text(self._fmt_ui(item.get("average_cadence_steps_per_min"), "/min", 0))
+        if dpg.does_item_exist("trial_process_buttons_host"):
+            for item in self.trials:
+                key = self._trial_item_key(item)
+                label = item.get("recording_name") or item.get("path") or key
+                status = item.get("status") or "raw_saved"
+                with dpg.group(parent="trial_process_buttons_host", horizontal=True):
+                    dpg.add_button(label="Process", width=85,
+                                   callback=self._process_trial_from_user_data,
+                                   user_data=key)
+                    dpg.add_button(label="Delete", width=70,
+                                   callback=self._request_delete_trial_from_user_data,
+                                   user_data=key)
+                    dpg.add_button(label=str(label), width=170,
+                                   callback=lambda s, a, u=item: self._select_trial(u))
+                    dpg.add_text(str(status))
         if self.trials and not self.selected_trial and not self._trial_auto_selected:
             self._trial_auto_selected = True
             self._select_trial(self.trials[0])
@@ -805,13 +996,110 @@ class DearPyGuiApp:
             if dpg.does_item_exist("trial_status"):
                 dpg.set_value("trial_status", f"Could not open overlay: {exc}")
 
+    @staticmethod
+    def _trial_item_key(item):
+        if not item:
+            return ""
+        return str(item.get("path") or item.get("trial_id")
+                   or item.get("recording_name") or "")
+
+    def _process_trial_from_user_data(self, sender=None, app_data=None,
+                                      user_data=None):
+        self._process_trial_key(str(user_data or ""))
+
     def _process_trial_item(self, item):
-        trial = self.trial_manager.get_trial(item.get("trial_id") or item.get("path"))
-        if trial:
-            self._process_trial(trial)
+        self._process_trial_key(self._trial_item_key(item))
+
+    def _process_trial_key(self, key):
+        import dearpygui.dearpygui as dpg
+        trial = self.trial_manager.get_trial(key) if key else None
+        if not trial:
+            if dpg.does_item_exist("trial_status"):
+                dpg.set_value("trial_status", f"Could not find trial for Process: {key}")
+            print(f"[trials] process click could not resolve trial: {key}")
+            return
+        self.selected_trial = trial
+        self.trial_frame = 0
+        self.trial_playing = False
+        self._trial_dirty = True
+        if dpg.does_item_exist("trial_status"):
+            dpg.set_value("trial_status", f"Process clicked for {trial.path.name}")
+        print(f"[trials] process click -> {trial.path}")
+        self._process_trial(trial)
+
+    def _request_delete_selected_trial(self, *_):
+        if not self.selected_trial:
+            try:
+                import dearpygui.dearpygui as dpg
+                if dpg.does_item_exist("trial_status"):
+                    dpg.set_value("trial_status", "Select a trial before deleting.")
+            except Exception:
+                pass
+            return
+        self._request_delete_trial_key(self.selected_trial.path.name)
+
+    def _request_delete_trial_from_user_data(self, sender=None, app_data=None,
+                                             user_data=None):
+        self._request_delete_trial_key(str(user_data or ""))
+
+    def _request_delete_trial_key(self, key):
+        import dearpygui.dearpygui as dpg
+        trial = self.trial_manager.get_trial(key) if key else None
+        if not trial:
+            if dpg.does_item_exist("trial_status"):
+                dpg.set_value("trial_status", f"Could not find trial for Delete: {key}")
+            return
+        self._pending_delete_trial_key = trial.path.name
+        if dpg.does_item_exist("delete_trial_text"):
+            dpg.set_value(
+                "delete_trial_text",
+                f"Delete recording '{trial.path.name}' and all of its files? "
+                "This cannot be undone.")
+        if dpg.does_item_exist("delete_trial_modal"):
+            dpg.configure_item("delete_trial_modal", show=True)
+
+    def _cancel_delete_trial(self, *_):
+        import dearpygui.dearpygui as dpg
+        self._pending_delete_trial_key = None
+        if dpg.does_item_exist("delete_trial_modal"):
+            dpg.configure_item("delete_trial_modal", show=False)
+
+    def _confirm_delete_trial(self, *_):
+        import dearpygui.dearpygui as dpg
+        key = self._pending_delete_trial_key
+        self._pending_delete_trial_key = None
+        if dpg.does_item_exist("delete_trial_modal"):
+            dpg.configure_item("delete_trial_modal", show=False)
+        if not key:
+            return
+        try:
+            trial = self.trial_manager.get_trial(key)
+            if trial is not None:
+                release_video_cache_for_trial(trial.path)
+            deleted = self.trial_manager.delete_trial(key)
+            if self.selected_trial and self.selected_trial.path.name == key:
+                self.selected_trial = None
+                self.trial_frame = 0
+                self.trial_playing = False
+                self._trial_dirty = True
+            self._trial_auto_selected = False
+            self._refresh_trials()
+            self._rebuild_step_table()
+            if dpg.does_item_exist("trial_status"):
+                dpg.set_value("trial_status", f"Deleted recording {deleted.name}")
+        except Exception as exc:
+            if dpg.does_item_exist("trial_status"):
+                dpg.set_value("trial_status", f"Delete failed: {exc}")
+            print(f"[trials] delete failed for {key}: {exc}")
 
     def _process_trial(self, trial):
         import dearpygui.dearpygui as dpg
+        if (self._processing_state.get("running")
+                and self._processing_thread is not None
+                and not self._processing_thread.is_alive()):
+            self._set_processing_state(
+                running=False, done=True, error="Processing thread stopped unexpectedly",
+                progress=0.0, message="Previous processing stopped unexpectedly")
         if self._is_processing():
             if dpg.does_item_exist("trial_status"):
                 dpg.set_value("trial_status", "Processing is already running.")

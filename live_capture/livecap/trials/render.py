@@ -1,18 +1,62 @@
 """OpenCV renderers for the Trials review page."""
 from __future__ import annotations
 
+import os
+os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
+os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "-8")
+
 import cv2
 import numpy as np
+from contextlib import contextmanager
 from pathlib import Path
 
 from ..gui.render import (ACCENT, BG, CENTER_C, FG, GRID, LEFT_C, MUTED, OK_C,
                           PANEL, RIGHT_C, WARN, _fmt, _fit_image,
+                          draw_precision_pose_overlay,
                           _panel, _text)
 from ..pose.detector import IDX, SKELETON
 from ..state import ANGLE_NAMES
 from .manager import Trial
 
 _VIDEO_CACHE = {}
+
+try:
+    cv2.setLogLevel(0)
+except Exception:
+    pass
+
+
+@contextmanager
+def _suppress_native_stderr():
+    """Temporarily hide FFmpeg decoder chatter emitted below Python logging."""
+    try:
+        saved = os.dup(2)
+        devnull = os.open(os.devnull, os.O_WRONLY)
+    except OSError:
+        yield
+        return
+    try:
+        os.dup2(devnull, 2)
+        yield
+    finally:
+        try:
+            os.dup2(saved, 2)
+        finally:
+            os.close(saved)
+            os.close(devnull)
+
+
+def release_video_cache_for_trial(trial_path: Path):
+    root = str(Path(trial_path))
+    for key, cap in list(_VIDEO_CACHE.items()):
+        try:
+            match = str(key).startswith(root)
+            if match and cap is not None:
+                cap.release()
+        except Exception:
+            pass
+        if str(key).startswith(root):
+            _VIDEO_CACHE.pop(key, None)
 
 
 def _read_video_frame(path: Path, frame_idx: int):
@@ -25,9 +69,29 @@ def _read_video_frame(path: Path, frame_idx: int):
         if not cap.isOpened():
             return None
         _VIDEO_CACHE[key] = cap
-    cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(frame_idx)))
-    ok, frame = cap.read()
+    with _suppress_native_stderr():
+        cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(frame_idx)))
+        ok, frame = cap.read()
     return frame if ok and frame is not None else None
+
+
+def _load_video_frames(path: Path):
+    if not path.exists():
+        return []
+    frames = []
+    with _suppress_native_stderr():
+        cap = cv2.VideoCapture(str(path))
+        if not cap.isOpened():
+            return []
+        try:
+            while True:
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    break
+                frames.append(frame)
+        finally:
+            cap.release()
+    return frames
 
 
 def _camera_keypoint_score(kp):
@@ -54,7 +118,10 @@ def _camera_scene_skeleton(img, x, y, w, h, trial: Trial, frame_idx: int,
     cam_id = _replay_camera_id(trial, replay_camera)
     _panel(img, x, y, w, h, f"Camera skeleton replay cam{cam_id}")
     frame = _read_video_frame(trial.path / f"cam{cam_id}.mp4", frame_idx)
-    px, py, pw, ph = x + 8, y + 26, w - 16, h - 34
+    H, W = img.shape[:2]
+    px, py = x + 8, y + 26
+    pw = max(1, min(w - 16, W - px))
+    ph = max(1, min(h - 34, H - py))
     if frame is None:
         _draw_skeleton(img, x, y, w, h, trial.frames, frame_idx)
         return
@@ -69,7 +136,10 @@ def _camera_scene_skeleton(img, x, y, w, h, trial: Trial, frame_idx: int,
         kp[good, 1] = kp[good, 1] * scale + oy
         _draw_line_skeleton_overlay(canvas, kp, angles,
                                     show_labels=(show_labels and pw >= 520 and ph >= 340))
-    img[py:py + ph, px:px + pw] = canvas
+    paste_h = min(ph, canvas.shape[0], H - py)
+    paste_w = min(pw, canvas.shape[1], W - px)
+    if paste_h > 0 and paste_w > 0:
+        img[py:py + paste_h, px:px + paste_w] = canvas[:paste_h, :paste_w]
 
 
 def _side_color(tag):
@@ -402,7 +472,8 @@ def build_trial_review(trial: Trial | None, frame_idx: int = 0, size=(1600, 900)
 
     left_x, top_y = 20, 240
     gap = 16
-    top_h = max(340, min(430, int(H * 0.42)))
+    available_h = max(180, H - top_y - 20)
+    top_h = max(180, min(430, int(H * 0.42), available_h))
     pressure_w = max(180, min(300, int(W * 0.20)))
     right_min = 260
     max_left = max(260, W - 40 - pressure_w - right_min - 2 * gap)
@@ -524,20 +595,18 @@ def render_processed_playback(recording_dir: str | Path, cfg, max_width: int = 1
     raw_pose = trial.rawForce  # touch raw data lazily before long video work
     _ = raw_pose.get("START")
 
-    caps = []
+    video_frames = []
     labels = []
     for cam_id in (0, 1):
         path = rec_dir / f"cam{cam_id}.mp4"
-        cap = cv2.VideoCapture(str(path)) if path.exists() else None
-        if cap is not None and cap.isOpened():
-            caps.append(cap)
+        frames = _load_video_frames(path)
+        if frames:
+            video_frames.append(frames)
             labels.append(f"cam{cam_id}")
         else:
-            if cap is not None:
-                cap.release()
-            caps.append(None)
+            video_frames.append([])
             labels.append(f"cam{cam_id} unavailable")
-    if caps[0] is None and caps[1] is None:
+    if not video_frames[0] and not video_frames[1]:
         out_dir = rec_dir / "playback"
         out_dir.mkdir(exist_ok=True)
         out_path = out_dir / "skeleton_overlay.mp4"
@@ -565,28 +634,19 @@ def render_processed_playback(recording_dir: str | Path, cfg, max_width: int = 1
     writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, out_size)
     duration = float(np.nanmax(t)) if t.size else 0.0
     n_out = max(len(t), int(np.ceil(duration * fps)) + 1)
-    frame_cache = {}
     for out_i in range(n_out):
         out_t = out_i / fps
         i = int(np.clip(np.searchsorted(t, out_t, side="left"), 0, len(t) - 1))
         if i > 0 and abs(t[i - 1] - out_t) <= abs(t[i] - out_t):
             i -= 1
         panels = []
-        for cam_id, cap in enumerate(caps):
-            frame = frame_cache.get(cam_id)
-            if cap is not None:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, i)
-                ok, frame = cap.read()
-                if not ok:
-                    frame = frame_cache.get(cam_id)
-                elif frame is not None:
-                    frame_cache[cam_id] = frame
+        for cam_id, frames in enumerate(video_frames):
+            frame = None
+            if frames:
+                frame = frames[min(i, len(frames) - 1)]
             kp = kp0[i] if cam_id == 0 and i < len(kp0) else (kp1[i] if i < len(kp1) else None)
             panel = _overlay_video_frame(frame, kp, _angle_dict(pose_npz, i), labels[cam_id])
             panels.append(_fit_image(panel, panel_w, panel_h))
         writer.write(np.hstack(panels))
     writer.release()
-    for cap in caps:
-        if cap is not None:
-            cap.release()
     return out_path
