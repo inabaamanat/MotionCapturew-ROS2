@@ -112,4 +112,4 @@ Bertec Treadmill
 ## Goals
 
 * Modularize a monolithic biomechanics application into reusable ROS nodes.
-* INverse dynamics!
+* Inverse dynamics!
