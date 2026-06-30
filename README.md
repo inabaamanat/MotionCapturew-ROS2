@@ -4,7 +4,7 @@
 
 This project is a ROS 2 Jazzy implementation of a human-in-the-loop (HILO) treadmill optimization system for adaptive gait training and biomechanics research. The original Python application has been refactored into a modular ROS architecture, where each package is responsible for a single subsystem.
 
-The system communicates with a Bertec instrumented treadmill, processes gait information, performs self-paced treadmill control, and supports Bayesian optimization for adaptive parameter tuning.
+The system communicates with a Bertec instrumented treadmill, processes gait information, performs self-paced treadmill control, and supports Bayesian optimization for adaptive parameter tuning. Motion capture is also integrated for data processing.
 
 ---
 
